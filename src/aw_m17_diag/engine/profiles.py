@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 
-from aw_m17_diag.collectors._utils import find_hwmon_by_name
+from aw_m17_diag.collectors._utils import find_hwmon_by_name, read_int_safe
 from aw_m17_diag.models import WorkloadProfileName, WorkloadProfileSpec
 
 PROFILES: dict[WorkloadProfileName, WorkloadProfileSpec] = {
@@ -106,6 +107,45 @@ def _write_sysfs(
         errors.append(f"{path}: {exc}")
 
 
+def write_fan_boost(
+    path: Path,
+    boost: int,
+    platform_profile: str,
+    applied: list[str],
+    errors: list[str],
+    dry_run: bool,
+) -> None:
+    """Write Alienware WMI fan*_boost, handling firmware EBADRQC (Errno 56) under preset profiles.
+
+    On Alienware WMAX/AWCC firmware (such as 0DG9D5 BIOS 2.21.1), invoking WMI
+    Thermal_Control (0x15) op 0x02 (AWCC_OP_SET_FAN_BOOST) while a preset ACPI
+    platform_profile ('balanced-performance', 'balanced', 'quiet', 'cool') is active
+    causes the EC to return AWCC_FAILURE_CODE (0xFFFFFFFF), which alienware-wmi-wmax
+    translates to -EBADRQC ([Errno 56] Invalid request code) because manual fan boost
+    overrides are locked unless platform_profile is 'custom' (0x00).
+    """
+    if dry_run:
+        applied.append(f"[DRY-RUN] {path} <- {boost}")
+        return
+
+    current = read_int_safe(path)
+    if boost == 0 and current == 0:
+        applied.append(f"{path} == 0 (EC auto-curve active)")
+        return
+
+    try:
+        path.write_text(f"{boost}\n", encoding="utf-8")
+        applied.append(f"{path} <- {boost}")
+    except OSError as exc:
+        if exc.errno == errno.EBADRQC and platform_profile != "custom":
+            applied.append(
+                f"{path}: EC auto-curve managed by '{platform_profile}' profile "
+                "(WMI 0x15 op 0x02 requires 'custom' profile for manual boost)"
+            )
+        else:
+            errors.append(f"{path}: {exc}")
+
+
 def apply_workload_profile(
     spec: WorkloadProfileSpec,
     dry_run: bool = False,
@@ -190,7 +230,21 @@ def apply_workload_profile(
     # 6. Alienware WMI Fan Boost (hwmon5)
     aw_hwmon = find_hwmon_by_name("alienware_wmi", sys_root / "class" / "hwmon")
     if aw_hwmon is not None:
-        _write_sysfs(aw_hwmon / "fan1_boost", str(spec.cpu_fan_boost), applied, errors, dry_run)
-        _write_sysfs(aw_hwmon / "fan2_boost", str(spec.gpu_fan_boost), applied, errors, dry_run)
+        write_fan_boost(
+            aw_hwmon / "fan1_boost",
+            spec.cpu_fan_boost,
+            spec.platform_profile,
+            applied,
+            errors,
+            dry_run,
+        )
+        write_fan_boost(
+            aw_hwmon / "fan2_boost",
+            spec.gpu_fan_boost,
+            spec.platform_profile,
+            applied,
+            errors,
+            dry_run,
+        )
 
     return tuple(applied), tuple(errors)

@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import errno
 from pathlib import Path
+from unittest.mock import patch
 
 from aw_m17_diag.engine.evaluator import evaluate_preflight, evaluate_snapshots
-from aw_m17_diag.engine.profiles import apply_workload_profile, get_workload_profile
+from aw_m17_diag.engine.profiles import (
+    apply_workload_profile,
+    get_workload_profile,
+    write_fan_boost,
+)
 from aw_m17_diag.models import (
     MemorySnapshot,
     Severity,
@@ -93,3 +99,30 @@ def test_apply_workload_profile_dry_run(tmp_path: Path) -> None:
     assert any("default_ps_max_latency_us <- 0" in item for item in applied)
     assert any("platform_profile <- balanced-performance" in item for item in applied)
     assert any("constraint_0_power_limit_uw <- 65000000" in item for item in applied)
+
+
+def test_write_fan_boost_handles_ebadrqc_under_preset_profile(tmp_path: Path) -> None:
+    """Verify Errno 56 (EBADRQC) on fan*_boost is handled cleanly when platform_profile != custom."""
+    fan_path = tmp_path / "fan1_boost"
+    fan_path.write_text("0\n", encoding="utf-8")
+
+    applied: list[str] = []
+    errors: list[str] = []
+
+    with patch.object(
+        Path,
+        "write_text",
+        side_effect=OSError(errno.EBADRQC, "Invalid request code"),
+    ):
+        write_fan_boost(
+            path=fan_path,
+            boost=35,
+            platform_profile="balanced-performance",
+            applied=applied,
+            errors=errors,
+            dry_run=False,
+        )
+
+    assert not errors
+    assert len(applied) == 1
+    assert "EC auto-curve managed by 'balanced-performance' profile" in applied[0]
