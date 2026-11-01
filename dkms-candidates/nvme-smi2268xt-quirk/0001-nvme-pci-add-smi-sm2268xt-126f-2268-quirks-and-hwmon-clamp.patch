@@ -1,0 +1,35 @@
+From: aw-m17-diag <root@mothership>
+Subject: [PATCH] nvme: add quirks and hwmon 0xFFFE clamp for Silicon Motion SM2268XT [126f:2268]
+
+The Inland QN450 NVMe SSD uses a DRAM-less Silicon Motion SM2268XT controller
+(PCI ID 126f:2268). Without a quirk entry in nvme_id_table:
+  1. Entering deep APST sleep states causes the controller to drop off the PCIe bus.
+  2. Unpopulated temperature limit registers report 0xFFFE Kelvin (65,261.85 C) in hwmon.
+  3. Namespace descriptor table lacks UUID alongside old NGUID.
+
+Add PCI_VDEVICE(SMI, 0x2268) with NVME_QUIRK_NO_DEEPEST_PS | NVME_QUIRK_BOGUS_NID
+and ignore >= 0xFF00 Kelvin thresholds in nvme_hwmon_read().
+---
+ drivers/nvme/host/hwmon.c | 4 ++++
+ drivers/nvme/host/pci.c   | 2 ++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -3550,6 +3550,8 @@ static const struct pci_device_id nvme_id_table[] = {
+ 	{ PCI_VDEVICE(SMI, 0x2262),	/* Silicon Motion SM2262 */
+ 		.driver_data = NVME_QUIRK_NO_DEEPEST_PS |
+ 				NVME_QUIRK_IGNORED_DEV_SUBNQN, },
++	{ PCI_VDEVICE(SMI, 0x2268),	/* Silicon Motion SM2268XT (Inland QN450) */
++		.driver_data = NVME_QUIRK_NO_DEEPEST_PS | NVME_QUIRK_BOGUS_NID, },
+diff --git a/drivers/nvme/host/hwmon.c b/drivers/nvme/host/hwmon.c
+--- a/drivers/nvme/host/hwmon.c
++++ b/drivers/nvme/host/hwmon.c
+@@ -122,6 +122,10 @@ static int nvme_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
+ 		return err;
++	/* Clamp uninitialized 0xFFFE Kelvin (65261.85 C) thresholds on SM2268XT */
++	if (*val > 200000)
++		*val = 85000;
+ 	return 0;
+ }

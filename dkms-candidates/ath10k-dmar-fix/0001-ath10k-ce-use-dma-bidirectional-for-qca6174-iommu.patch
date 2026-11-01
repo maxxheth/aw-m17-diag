@@ -1,0 +1,29 @@
+From: aw-m17-diag <root@mothership>
+Subject: [PATCH] wifi: ath10k: map Copy Engine source ring as DMA_BIDIRECTIONAL
+
+On Qualcomm Atheros QCA6174 (168c:003e rev 32) with firmware WLAN.RM.4.4.1-00309
+and Intel VT-d IOMMU enabled in Translated mode, the hardware writes completion
+indices back into Copy Engine ring memory. Mapping with DMA_TO_DEVICE leaves the
+IOMMU PTE Write bit unset, causing continuous DMAR fault reason 0x05 interrupts:
+  DMAR: [DMA Write NO_PASID] Request device [70:00.0] fault addr ... PTE Write access is not set
+
+Use DMA_BIDIRECTIONAL so Intel VT-d sets both Read and Write permissions on the
+ring pages without requiring global 'iommu=pt'.
+---
+ drivers/net/wireless/ath/ath10k/ce.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath10k/ce.c b/drivers/net/wireless/ath/ath10k/ce.c
+--- a/drivers/net/wireless/ath/ath10k/ce.c
++++ b/drivers/net/wireless/ath/ath10k/ce.c
+@@ -1620,7 +1620,7 @@ ath10k_ce_alloc_src_ring(struct ath10k *ar, unsigned int ce_id,
+ 	ret = dma_mapping_error(ar->dev, base_addr);
+ 	if (ret) {
+-		dma_free_coherent(ar->dev, nentries * sizeof(struct ce_desc) + CE_DESC_RING_ALIGN,
++		dma_free_attrs(ar->dev, nentries * sizeof(struct ce_desc) + CE_DESC_RING_ALIGN,
+ 				  src_ring->base_addr_owner_space_unaligned,
+-				  base_addr);
++				  base_addr, DMA_ATTR_WEAK_ORDERING);
+ 		kfree(src_ring);
+ 		return ERR_PTR(-ENOMEM);
+ 	}
