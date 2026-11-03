@@ -113,6 +113,9 @@ class GpuDisplaySnapshot:
     i915_workqueue_hog_count: int
     flatpak_nvidia_gl_versions: tuple[str, ...]
     flatpak_driver_mismatch: bool
+    gpu_clock_graphics_mhz: int | None = None
+    gpu_clock_mem_mhz: int | None = None
+    gpu_sw_thermal_slowdown: bool = False
 
 
 @dataclass(frozen=True, slots=True)

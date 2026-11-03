@@ -101,6 +101,60 @@ def test_apply_workload_profile_dry_run(tmp_path: Path) -> None:
     assert any("constraint_0_power_limit_uw <- 65000000" in item for item in applied)
 
 
+def test_evaluate_snapshots_and_preflight_detect_30w_gpu_clamp() -> None:
+    """Verify the 30W / P5 (810 MHz VRAM) EC thermal slowdown clamp triggers CRITICAL."""
+    from dataclasses import replace
+
+    storage, pcie, gpu, tp = make_sample_snapshots()
+    clamped_gpu = replace(
+        gpu,
+        gpu_temp_c=51,
+        gpu_power_w=27.2,
+        gpu_power_cap_w=30.0,
+        gpu_pstate="P5",
+        gpu_clock_graphics_mhz=1185,
+        gpu_clock_mem_mhz=810,
+        gpu_sw_thermal_slowdown=True,
+    )
+    clamped_tp = replace(tp, platform_profile="balanced-performance")
+    mem = MemorySnapshot(
+        ram_total_gib=62.6,
+        ram_available_gib=45.0,
+        ram_used_percent=28.0,
+        swap_total_gib=32.0,
+        swap_free_gib=32.0,
+        swap_used_percent=0.0,
+        swappiness=10,
+        vfs_cache_pressure=50,
+        dirty_ratio=10,
+        dirty_background_ratio=5,
+        dirty_pages_mib=4.0,
+    )
+    findings = evaluate_snapshots(
+        storage=storage,
+        memory=mem,
+        pcie_iommu=pcie,
+        gpu_display=clamped_gpu,
+        thermal_power=clamped_tp,
+    )
+    by_id = {f.check_id: f for f in findings}
+    assert by_id["GPU-POWER-03"].severity == Severity.CRITICAL
+
+    report = SystemAuditReport(
+        kernel_release="7.0.0-42-generic",
+        cmdline="ro quiet splash",
+        storage=storage,
+        memory=mem,
+        pcie_iommu=pcie,
+        gpu_display=clamped_gpu,
+        thermal_power=clamped_tp,
+    )
+    ready, checks = evaluate_preflight(report=report, workload="gaming")
+    assert not ready
+    chk_by_id = {c.check_id: c for c in checks}
+    assert chk_by_id["PRE-GAME-GPU"].severity == Severity.CRITICAL
+
+
 def test_write_fan_boost_handles_ebadrqc_under_preset_profile(tmp_path: Path) -> None:
     """Verify Errno 56 (EBADRQC) on fan*_boost is handled cleanly when platform_profile != custom."""
     fan_path = tmp_path / "fan1_boost"

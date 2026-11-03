@@ -1,0 +1,19 @@
+*.swp
+*.swo
+*~
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Kernel build intermediates
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.order
+*.symvers
+.*.cmd
+.tmp_versions/
+modules.order
+Module.symvers

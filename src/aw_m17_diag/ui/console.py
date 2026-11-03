@@ -77,11 +77,19 @@ def render_audit_report(report: SystemAuditReport) -> None:
     )
 
     gpu = report.gpu_display
+    clk_str = (
+        f" | Clocks: Core={gpu.gpu_clock_graphics_mhz}MHz, VRAM={gpu.gpu_clock_mem_mhz}MHz"
+        if gpu.gpu_clock_graphics_mhz is not None
+        else ""
+    )
+    therm_clamp_str = (
+        " [bold red](SW Thermal Slowdown ACTIVE!)[/bold red]" if gpu.gpu_sw_thermal_slowdown else ""
+    )
     hw_table.add_row(
         "GPU & Hybrid Display",
         f"RTX 2070 Max-Q [10de:1f10] + i915\nNVIDIA Driver: {gpu.nvidia_driver_version}",
         f"Temp: {gpu.gpu_temp_c}°C | Power: {gpu.gpu_power_w}W / {gpu.gpu_power_cap_w}W | "
-        f"VRAM: {gpu.gpu_vram_used_mib}/{gpu.gpu_vram_total_mib} MiB ({gpu.gpu_pstate})\n"
+        f"VRAM: {gpu.gpu_vram_used_mib}/{gpu.gpu_vram_total_mib} MiB ({gpu.gpu_pstate}){clk_str}{therm_clamp_str}\n"
         f"KMS Poll Disabled: {gpu.drm_kms_poll_disabled} (Hogs: {gpu.i915_workqueue_hog_count}x) | "
         f"UCSI Blacklisted: {gpu.ucsi_ccg_blacklisted}",
     )

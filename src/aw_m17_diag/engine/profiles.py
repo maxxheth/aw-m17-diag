@@ -6,8 +6,13 @@ import errno
 import os
 from pathlib import Path
 
-from aw_m17_diag.collectors._utils import find_hwmon_by_name, read_int_safe
+from aw_m17_diag.collectors._utils import find_hwmon_by_name, read_int_safe, run_cmd_safe
+from aw_m17_diag.collectors.gpu_display import collect_gpu_display
 from aw_m17_diag.models import WorkloadProfileName, WorkloadProfileSpec
+
+_UNCLAMP_KO = Path(
+    "/var/www/aw-m17-diag/dkms-candidates/nvidia-s3-power-unclamp/nvidia_power_unclamp.ko"
+)
 
 PROFILES: dict[WorkloadProfileName, WorkloadProfileSpec] = {
     WorkloadProfileName.OLLAMA_HEAVY: WorkloadProfileSpec(
@@ -15,7 +20,7 @@ PROFILES: dict[WorkloadProfileName, WorkloadProfileSpec] = {
         description=(
             "Optimized for sustained multi-hour local LLM inference (AVX2 + CUDA). "
             "Clamps CPU PL1 to 65W / PL2 to 85W to prevent VRM/thermal runaway, "
-            "sets swappiness=10 & dirty_ratio=10, and pre-stages fan boost."
+            "sets swappiness=10 & dirty_ratio=10, and unclamps post-S3 30W GPU cap."
         ),
         platform_profile="balanced-performance",
         epp="balance_performance",
@@ -33,8 +38,8 @@ PROFILES: dict[WorkloadProfileName, WorkloadProfileSpec] = {
         name=WorkloadProfileName.GAMING_PRIME,
         description=(
             "Optimized for RTX 2070 Max-Q 90W gaming & Steam PRIME offload. "
-            "Prioritizes GPU thermal budget by capping sustained CPU PL1 at 55W "
-            "(75W short burst) and disabling DRM KMS connector polling."
+            "Balances shared CPU/GPU heatpipe with 55W/75W CPU RAPL & balance_performance EPP, "
+            "disables DRM KMS polling, and clears post-S3-resume 30W / 810MHz NVIDIA clamp."
         ),
         platform_profile="balanced-performance",
         epp="balance_performance",
@@ -137,13 +142,46 @@ def write_fan_boost(
         path.write_text(f"{boost}\n", encoding="utf-8")
         applied.append(f"{path} <- {boost}")
     except OSError as exc:
-        if exc.errno == errno.EBADRQC and platform_profile != "custom":
+        if exc.errno == errno.EBADRQC:
             applied.append(
                 f"{path}: EC auto-curve managed by '{platform_profile}' profile "
-                "(WMI 0x15 op 0x02 requires 'custom' profile for manual boost)"
+                "(WMI 0x15 op 0x02 locks manual fan boost under preset profiles)"
             )
         else:
             errors.append(f"{path}: {exc}")
+
+
+def _unclamp_nvidia_s3_power_state(applied: list[str], errors: list[str]) -> None:
+    """Clear the NVIDIA RTX 2070 Max-Q post-S3-resume 30W / P5 (810 MHz) battery clamp."""
+    gpu = collect_gpu_display(klog="")
+    is_clamped = (gpu.gpu_power_cap_w is not None and gpu.gpu_power_cap_w < 60.0) or (
+        gpu.gpu_sw_thermal_slowdown and (gpu.gpu_temp_c is not None and gpu.gpu_temp_c < 75)
+    )
+    if not is_clamped:
+        return
+
+    if not _UNCLAMP_KO.is_file() and (_UNCLAMP_KO.parent / "Makefile").is_file():
+        run_cmd_safe(["make", "-C", str(_UNCLAMP_KO.parent)])
+
+    if not _UNCLAMP_KO.is_file():
+        errors.append(
+            f"RTX 2070 Max-Q is clamped at {gpu.gpu_power_cap_w}W ({gpu.gpu_pstate}), "
+            f"but {_UNCLAMP_KO} is not built."
+        )
+        return
+
+    run_cmd_safe(["rmmod", "nvidia_power_unclamp"])
+    rc, out = run_cmd_safe(["insmod", str(_UNCLAMP_KO)])
+    run_cmd_safe(["rmmod", "nvidia_power_unclamp"])
+    if rc != 0:
+        errors.append(f"nvidia_power_unclamp failed: {out.strip()}")
+        return
+
+    after = collect_gpu_display(klog="")
+    applied.append(
+        f"nvidia_power_unclamp: RTX 2070 Max-Q AC power & D-Notifier 0xD1 synced "
+        f"({gpu.gpu_power_cap_w}W/{gpu.gpu_pstate} -> {after.gpu_power_cap_w}W/{after.gpu_pstate})"
+    )
 
 
 def apply_workload_profile(
@@ -246,5 +284,12 @@ def apply_workload_profile(
             errors,
             dry_run,
         )
+
+    # 7. Clear post-S3-resume NVIDIA 30W / 810MHz VRAM battery clamp if active
+    if not dry_run and spec.name in {
+        WorkloadProfileName.GAMING_PRIME,
+        WorkloadProfileName.OLLAMA_HEAVY,
+    }:
+        _unclamp_nvidia_s3_power_state(applied, errors)
 
     return tuple(applied), tuple(errors)

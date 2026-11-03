@@ -18,23 +18,32 @@ _WQ_HOG_RE = re.compile(
 
 
 def _query_nvidia_smi() -> tuple[
-    str, int | None, float | None, float | None, int | None, int | None, str
+    str,
+    int | None,
+    float | None,
+    float | None,
+    int | None,
+    int | None,
+    str,
+    int | None,
+    int | None,
+    bool,
 ]:
-    """Query nvidia-smi for driver version, temp, power, power cap, vram, and pstate."""
+    """Query nvidia-smi for driver, temp, power, enforced cap, vram, pstate, clocks, and thermal slowdown."""
     rc, out = run_cmd_safe(
         [
             "nvidia-smi",
-            "--query-gpu=driver_version,temperature.gpu,power.draw,power.max_limit,memory.used,memory.total,pstate",
+            "--query-gpu=driver_version,temperature.gpu,power.draw,enforced.power.limit,power.max_limit,memory.used,memory.total,pstate,clocks.current.graphics,clocks.current.memory,clocks_event_reasons.sw_thermal_slowdown",
             "--format=csv,noheader,nounits",
         ]
     )
     if rc != 0 or not out.strip():
-        return "Unknown", None, None, None, None, None, "Unknown"
+        return "Unknown", None, None, None, None, None, "Unknown", None, None, False
 
     line = out.strip().splitlines()[0]
     parts = [p.strip() for p in line.split(",")]
-    if len(parts) < 7:
-        return "Unknown", None, None, None, None, None, "Unknown"
+    if len(parts) < 11:
+        return "Unknown", None, None, None, None, None, "Unknown", None, None, False
 
     driver_ver = parts[0]
     temp_c = int(parts[1]) if parts[1].isdigit() else None
@@ -45,11 +54,28 @@ def _query_nvidia_smi() -> tuple[
     try:
         power_cap_w: float | None = round(float(parts[3]), 2)
     except ValueError:
-        power_cap_w = None
-    vram_used = int(parts[4]) if parts[4].isdigit() else None
-    vram_total = int(parts[5]) if parts[5].isdigit() else None
-    pstate = parts[6]
-    return driver_ver, temp_c, power_w, power_cap_w, vram_used, vram_total, pstate
+        try:
+            power_cap_w = round(float(parts[4]), 2)
+        except ValueError:
+            power_cap_w = None
+    vram_used = int(parts[5]) if parts[5].isdigit() else None
+    vram_total = int(parts[6]) if parts[6].isdigit() else None
+    pstate = parts[7]
+    clock_gr = int(parts[8]) if parts[8].isdigit() else None
+    clock_mem = int(parts[9]) if parts[9].isdigit() else None
+    sw_therm_slowdown = parts[10].lower() == "active"
+    return (
+        driver_ver,
+        temp_c,
+        power_w,
+        power_cap_w,
+        vram_used,
+        vram_total,
+        pstate,
+        clock_gr,
+        clock_mem,
+        sw_therm_slowdown,
+    )
 
 
 def _get_flatpak_nvidia_gl_versions() -> tuple[str, ...]:
@@ -96,6 +122,9 @@ def collect_gpu_display(
         vram_used,
         vram_total,
         pstate,
+        clock_gr,
+        clock_mem,
+        sw_therm_slowdown,
     ) = _query_nvidia_smi()
 
     if driver_ver == "Unknown":
@@ -138,4 +167,7 @@ def collect_gpu_display(
         i915_workqueue_hog_count=max_hog_count,
         flatpak_nvidia_gl_versions=flatpak_gl_vers,
         flatpak_driver_mismatch=mismatch,
+        gpu_clock_graphics_mhz=clock_gr,
+        gpu_clock_mem_mhz=clock_mem,
+        gpu_sw_thermal_slowdown=sw_therm_slowdown,
     )

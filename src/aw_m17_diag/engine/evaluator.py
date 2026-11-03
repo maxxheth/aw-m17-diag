@@ -308,6 +308,63 @@ def evaluate_snapshots(
             )
         )
 
+    # 7B. Minefield 6B: NVIDIA RTX 2070 Max-Q Post-S3-Resume 30W / 810 MHz VRAM Clamp
+    gpu_clamped = (
+        gpu_display.gpu_power_cap_w is not None and gpu_display.gpu_power_cap_w < 60.0
+    ) or (
+        gpu_display.gpu_sw_thermal_slowdown
+        and (gpu_display.gpu_temp_c is not None and gpu_display.gpu_temp_c < 75)
+    )
+    if gpu_clamped:
+        cap_str = (
+            f"{gpu_display.gpu_power_cap_w}W"
+            if gpu_display.gpu_power_cap_w is not None
+            else "Unknown"
+        )
+        mem_clk_str = (
+            f"{gpu_display.gpu_clock_mem_mhz} MHz"
+            if gpu_display.gpu_clock_mem_mhz is not None
+            else "N/A"
+        )
+        findings.append(
+            HealthFinding(
+                check_id="GPU-POWER-03",
+                subsystem="GPU / EC Power",
+                title="RTX 2070 Max-Q 30W / 810 MHz VRAM Clamp (Post-S3-Resume AC/D-Notifier Desync)",
+                severity=Severity.CRITICAL,
+                current_value=(
+                    f"Cap={cap_str}, PState={gpu_display.gpu_pstate}, "
+                    f"VRAM={mem_clk_str}, SW_Therm_Slowdown={gpu_display.gpu_sw_thermal_slowdown} "
+                    f"@{gpu_display.gpu_temp_c}°C"
+                ),
+                expected_value="Cap=90.0W, P0 (6001 MHz VRAM), SW_Therm_Slowdown=False",
+                explanation=(
+                    "During S3 resume, the Alienware EC briefly reports _PSR=0 (AC offline) while "
+                    "re-negotiating with the 240W adapter, causing nvidia.ko to latch its 30.00W "
+                    "Battery / SW Thermal Slowdown state (P5, 810 MHz GDDR6) without re-syncing AC/0xD1."
+                ),
+                remediation_tier=RemediationTier.TIER_3_CUSTOM_DRIVER_DKMS,
+                remediation_cmd="sudo $(which uv) run aw-m17-diag profile set gaming-prime",
+            )
+        )
+    else:
+        findings.append(
+            HealthFinding(
+                check_id="GPU-POWER-03",
+                subsystem="GPU / EC Power",
+                title="RTX 2070 Max-Q Enforced Power Cap & Thermal Slowdown Status",
+                severity=Severity.PASS,
+                current_value=(
+                    f"Cap={gpu_display.gpu_power_cap_w}W ({gpu_display.gpu_pstate}), "
+                    f"Profile={thermal_power.platform_profile}"
+                ),
+                expected_value="Cap=90.0W, SW_Therm_Slowdown=False",
+                explanation="GPU power ceiling is uncapped at full 90W Max-Q envelope.",
+                remediation_tier=RemediationTier.TIER_1_USERSPACE_SYSFS,
+                remediation_cmd="None",
+            )
+        )
+
     # 8. Minefield 7: CPU MSR RAPL Uncapped PL1 (200W on 45W TDP i7-9750H)
     if thermal_power.msr_pl1_w is not None and thermal_power.msr_pl1_w > 90.0:
         findings.append(
@@ -439,6 +496,34 @@ def evaluate_preflight(
         )
 
     elif workload.lower() == "gaming":
+        gpu_clamped = (
+            report.gpu_display.gpu_power_cap_w is not None
+            and report.gpu_display.gpu_power_cap_w < 60.0
+        ) or (
+            report.gpu_display.gpu_sw_thermal_slowdown
+            and (report.gpu_display.gpu_temp_c is not None and report.gpu_display.gpu_temp_c < 75)
+        )
+        checks.append(
+            HealthFinding(
+                check_id="PRE-GAME-GPU",
+                subsystem="RTX 2070 Power Cap",
+                title="RTX 2070 Max-Q 90W TGP & GDDR6 Clock Unclamped",
+                severity=Severity.CRITICAL if gpu_clamped else Severity.PASS,
+                current_value=(
+                    f"Cap={report.gpu_display.gpu_power_cap_w}W, "
+                    f"PState={report.gpu_display.gpu_pstate}, "
+                    f"VRAM={report.gpu_display.gpu_clock_mem_mhz} MHz, "
+                    f"Profile={report.thermal_power.platform_profile}"
+                ),
+                expected_value="Cap=90.0W (P0 / 6001 MHz under load), Profile!='balanced-performance'",
+                explanation=(
+                    "Detects the 30W / P5 (810 MHz VRAM) ACPI SW Thermal Slowdown clamp caused by "
+                    "WMI profile 0xA1 ('balanced-performance') or S3 sleep/resume state."
+                ),
+                remediation_tier=RemediationTier.TIER_1_USERSPACE_SYSFS,
+                remediation_cmd="sudo $(which uv) run aw-m17-diag profile set gaming-prime",
+            )
+        )
         checks.append(
             HealthFinding(
                 check_id="PRE-GAME-GL",
