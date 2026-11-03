@@ -37,21 +37,23 @@ PROFILES: dict[WorkloadProfileName, WorkloadProfileSpec] = {
     WorkloadProfileName.GAMING_PRIME: WorkloadProfileSpec(
         name=WorkloadProfileName.GAMING_PRIME,
         description=(
-            "Optimized for RTX 2070 Max-Q 90W gaming & Steam PRIME offload. "
-            "Balances shared CPU/GPU heatpipe with 55W/75W CPU RAPL & balance_performance EPP, "
-            "disables DRM KMS polling, and clears post-S3-resume 30W / 810MHz NVIDIA clamp."
+            "Optimized for RTX 2070 Max-Q gaming & Steam PRIME offload. "
+            "Relieves shared heatpipe with 45W/65W CPU RAPL, 3.70GHz CPU turbo cap, "
+            "and 1650MHz GPU V/F sweet-spot ceiling to prevent 87°C VBIOS thermal throttling."
         ),
         platform_profile="balanced-performance",
         epp="balance_performance",
-        msr_pl1_w=55,
-        msr_pl2_w=75,
-        mmio_pl1_w=55,
-        mmio_pl2_w=75,
+        msr_pl1_w=45,
+        msr_pl2_w=65,
+        mmio_pl1_w=45,
+        mmio_pl2_w=65,
         swappiness=10,
         dirty_ratio=10,
         dirty_background_ratio=5,
         cpu_fan_boost=35,
         gpu_fan_boost=35,
+        cpu_max_freq_khz=3_700_000,
+        gpu_max_clock_mhz=1650,
     ),
     WorkloadProfileName.BALANCED_DAILY: WorkloadProfileSpec(
         name=WorkloadProfileName.BALANCED_DAILY,
@@ -211,11 +213,13 @@ def apply_workload_profile(
     if acpi_prof.exists() or dry_run:
         _write_sysfs(acpi_prof, spec.platform_profile, applied, errors, dry_run)
 
-    # 3. CPU Energy Performance Preference (EPP) across all cores
+    # 3. CPU Energy Performance Preference (EPP) & Max Turbo Frequency across all cores
     cpu_root = sys_root / "devices" / "system" / "cpu"
     if cpu_root.is_dir():
         for epp_file in sorted(cpu_root.glob("cpu[0-9]*/cpufreq/energy_performance_preference")):
             _write_sysfs(epp_file, spec.epp, applied, errors, dry_run)
+        for freq_file in sorted(cpu_root.glob("cpu[0-9]*/cpufreq/scaling_max_freq")):
+            _write_sysfs(freq_file, str(spec.cpu_max_freq_khz), applied, errors, dry_run)
 
     # 4. MSR & MMIO RAPL Power Limits (micro-Watts)
     msr_rapl = sys_root / "class" / "powercap" / "intel-rapl:0"
@@ -291,5 +295,21 @@ def apply_workload_profile(
         WorkloadProfileName.OLLAMA_HEAVY,
     }:
         _unclamp_nvidia_s3_power_state(applied, errors)
+
+    # 8. Apply NVIDIA GPU boost clock sweet-spot ceiling (-lgc) or reset (-rgc)
+    if not dry_run:
+        run_cmd_safe(["nvidia-smi", "-pm", "1"])
+        if spec.gpu_max_clock_mhz is not None:
+            rc, out = run_cmd_safe(["nvidia-smi", "-lgc", f"300,{spec.gpu_max_clock_mhz}"])
+            if rc == 0:
+                applied.append(
+                    f"nvidia-smi -lgc 300,{spec.gpu_max_clock_mhz} (GPU boost ceiling locked)"
+                )
+            else:
+                errors.append(f"nvidia-smi -lgc failed: {out.strip()}")
+        else:
+            rc, _ = run_cmd_safe(["nvidia-smi", "-rgc"])
+            if rc == 0:
+                applied.append("nvidia-smi -rgc (GPU boost clock range unlocked)")
 
     return tuple(applied), tuple(errors)

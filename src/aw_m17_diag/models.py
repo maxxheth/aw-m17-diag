@@ -195,6 +195,8 @@ class WorkloadProfileSpec:
     dirty_background_ratio: int
     cpu_fan_boost: int
     gpu_fan_boost: int
+    cpu_max_freq_khz: int = 4_500_000
+    gpu_max_clock_mhz: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
