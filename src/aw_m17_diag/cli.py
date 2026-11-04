@@ -14,7 +14,12 @@ from aw_m17_diag.collectors.crash_forensics import (
 from aw_m17_diag.collectors.thermal_power import collect_thermal_power
 from aw_m17_diag.engine.driver_advisor import export_dkms_candidates
 from aw_m17_diag.engine.evaluator import evaluate_preflight, run_full_audit
-from aw_m17_diag.engine.profiles import apply_workload_profile, get_workload_profile
+from aw_m17_diag.engine.profiles import (
+    apply_workload_profile,
+    configure_startup_profile,
+    get_startup_profile_status,
+    get_workload_profile,
+)
 from aw_m17_diag.models import WorkloadProfileName
 from aw_m17_diag.ui.console import (
     console,
@@ -23,6 +28,7 @@ from aw_m17_diag.ui.console import (
     render_driver_advisories,
     render_preflight_report,
     render_profiles_table,
+    render_startup_profile_status,
 )
 from aw_m17_diag.ui.dashboard import run_live_dashboard
 
@@ -123,7 +129,8 @@ def cmd_driver_advisor(
 def cmd_profile_show() -> None:
     """Display all available Alienware m17 workload profiles and live thermal/power settings."""
     tp = collect_thermal_power()
-    render_profiles_table(tp)
+    startup_status = get_startup_profile_status()
+    render_profiles_table(tp, startup_status=startup_status)
 
 
 @profile_app.command("set")
@@ -132,6 +139,14 @@ def cmd_profile_set(
         WorkloadProfileName,
         typer.Argument(help="Profile name to apply."),
     ],
+    startup: Annotated[
+        bool,
+        typer.Option(
+            "--startup/--no-startup",
+            "-s",
+            help="Also configure this profile to load automatically on system startup.",
+        ),
+    ] = False,
     dry_run: Annotated[
         bool,
         typer.Option("--dry-run", help="Preview sysfs/procfs writes without mutating system."),
@@ -139,7 +154,74 @@ def cmd_profile_set(
 ) -> None:
     """Apply a hardware workload tuning profile (requires root unless --dry-run)."""
     spec = get_workload_profile(name)
-    applied, errors = apply_workload_profile(spec=spec, dry_run=dry_run)
+    applied, errors = apply_workload_profile(
+        spec=spec,
+        dry_run=dry_run,
+        persist_startup=startup,
+    )
+    for item in applied:
+        console.print(f"[green]✓[/green] {item}")
+    for err in errors:
+        console.print(f"[bold red]✗[/bold red] {err}")
+    if errors:
+        raise typer.Exit(code=1)
+
+
+@profile_app.command("startup")
+def cmd_profile_startup(
+    name: Annotated[
+        WorkloadProfileName | None,
+        typer.Argument(help="Profile name to load automatically on startup."),
+    ] = None,
+    disable: Annotated[
+        bool,
+        typer.Option(
+            "--disable",
+            "-d",
+            help="Disable automatic startup profile loading on boot.",
+        ),
+    ] = False,
+    status: Annotated[
+        bool,
+        typer.Option(
+            "--status",
+            help="Show current startup profile and systemd service state.",
+        ),
+    ] = False,
+    apply_now: Annotated[
+        bool,
+        typer.Option(
+            "--apply-now/--no-apply-now",
+            help="Also apply the selected startup profile immediately to the live system.",
+        ),
+    ] = True,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Preview startup configuration changes without mutating system."),
+    ] = False,
+) -> None:
+    """Inspect, enable, or disable automatic workload profile loading on system startup."""
+    if status or (name is None and not disable):
+        render_startup_profile_status(get_startup_profile_status())
+        return
+
+    if disable and name is not None:
+        console.print("[bold red]✗[/bold red] Cannot specify both a profile name and --disable.")
+        raise typer.Exit(code=1)
+
+    if disable:
+        applied, errors = configure_startup_profile(name=None, dry_run=dry_run)
+    elif name is not None and apply_now:
+        spec = get_workload_profile(name)
+        applied, errors = apply_workload_profile(
+            spec=spec,
+            dry_run=dry_run,
+            persist_startup=True,
+        )
+    else:
+        assert name is not None
+        applied, errors = configure_startup_profile(name=name, dry_run=dry_run)
+
     for item in applied:
         console.print(f"[green]✓[/green] {item}")
     for err in errors:

@@ -4,6 +4,7 @@
 .venv/
 .pytest_cache/
 .ruff_cache/
+perf.data*
 
 # Kernel build intermediates
 *.o

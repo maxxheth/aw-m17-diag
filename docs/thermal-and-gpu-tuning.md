@@ -189,3 +189,40 @@ The DKMS helper module at [`dkms-candidates/nvidia-s3-power-unclamp/nvidia_power
 3. Forces a `1 -> 0` state transition (`rm_power_source_change_event(sp, 1)` followed by `rm_power_source_change_event(sp, 0)`) to bypass `.bss+0x1fece0` and execute RM internal control `0x2080205b` (AC Power Source Restore).
 4. Dispatches `rm_acpi_notify(sp, nvl, 0xc0)` (GPS Power Budget Refresh `0x00000122`) and `rm_acpi_notify(sp, nvl, 0xd1)` (D-Notifier Level 0 = Full 90.00 W Uncapped Power `0x20802092`).
 5. Immediately unloads itself (`-EAGAIN` init completion) after restoring `enforced.power.limit = 90.00 W` and clearing `SW Power Cap` / `SW Thermal Slowdown`.
+
+---
+
+## 6. Technical Appendix: Unplugged Killer E2500 (`alx`) PCIe MMIO Stats Stall (14 FPS -> 62.6 FPS Fix)
+
+### Symptom
+When running Ubisoft Connect games (*Assassin's Creed Mirage*) under Wine/Proton while on Wi-Fi (`wlp112s0`) with no Ethernet cable plugged into the Qualcomm Atheros Killer E2500 Gigabit NIC (`0000:6f:00.0` `[1969:e0b1]`, interface `enp111s0`), `winedevice.exe` (`wine_sechost_service`) consumes **73.5% of a CPU core in kernel space**, starving render threads and dropping in-game framerate to **14.0 FPS**.
+
+### Root Cause
+1. **Ubisoft Connect + Wine NSI Polling:** `upc.exe` / `UplayWebCore.exe` continuously polls Windows Network Store Interface (`nsi.sys` via `wine_sechost_service`) hundreds of times per second, triggering Linux Netlink `RTM_GETLINK` / `/proc/net/dev` dumps.
+2. **Synchronous PCIe MMIO Reads in `alx_get_stats64()`:** In `drivers/net/ethernet/atheros/alx/main.c`, `alx_get_stats64()` unconditionally calls `alx_update_hw_stats()`, which performs **49 synchronous uncached `ioread32()` PCIe MMIO register reads** (`0x1700..0x17c0`) on every query—even when `carrier == 0` (unplugged) or the interface is `DOWN`.
+
+### Automatic Mitigation in `gaming-prime`
+When `gaming-prime` is applied, `_manage_alx_nic()` in [`src/aw_m17_diag/engine/profiles.py`](../src/aw_m17_diag/engine/profiles.py):
+- Checks `/sys/bus/pci/drivers/alx/0000:6f:00.0/net/*/carrier`.
+- If `carrier != 1` (no Ethernet cable plugged in), unbinds `0000:6f:00.0` via `/sys/bus/pci/drivers/alx/unbind`, dropping `wine_sechost_service` kernel CPU overhead from **73.5% to 12%** and restoring full **60+ FPS**.
+- If a wired Ethernet cable is connected (`carrier == 1`), leaves `alx` bound. Switching back to non-gaming profiles (`balanced-daily`, `ollama-heavy`, `powersave`) automatically rebinds `0000:6f:00.0`.
+
+---
+
+## 7. Automatic Startup & S3 Resume Profile Management
+
+You can manage whether a workload profile loads for the current session only or automatically on every boot:
+
+```bash
+# Apply a profile for the current session only (does not alter boot startup profile):
+sudo aw-m17-diag profile set gaming-prime
+
+# Apply a profile AND set it to load automatically on system startup:
+sudo aw-m17-diag profile set gaming-prime --startup
+
+# Dedicated startup profile management:
+aw-m17-diag profile startup --status
+sudo aw-m17-diag profile startup gaming-prime
+sudo aw-m17-diag profile startup --disable
+```
+

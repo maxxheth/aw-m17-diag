@@ -9,6 +9,8 @@ from unittest.mock import patch
 from aw_m17_diag.engine.evaluator import evaluate_preflight, evaluate_snapshots
 from aw_m17_diag.engine.profiles import (
     apply_workload_profile,
+    configure_startup_profile,
+    get_startup_profile_status,
     get_workload_profile,
     write_fan_boost,
 )
@@ -180,3 +182,113 @@ def test_write_fan_boost_handles_ebadrqc_under_preset_profile(tmp_path: Path) ->
     assert not errors
     assert len(applied) == 1
     assert "EC auto-curve managed by 'balanced-performance' profile" in applied[0]
+
+
+def test_gaming_prime_unbinds_unplugged_alx_and_preserves_active_carrier(tmp_path: Path) -> None:
+    """Verify gaming-prime unbinds alx when carrier=0 and keeps it bound when carrier=1."""
+    sys_root = tmp_path / "sys"
+    proc_root = tmp_path / "proc"
+    alx_drv = sys_root / "bus" / "pci" / "drivers" / "alx"
+    iface_dir = alx_drv / "0000:6f:00.0" / "net" / "enp111s0"
+    iface_dir.mkdir(parents=True)
+    (sys_root / "bus" / "pci" / "devices" / "0000:6f:00.0").mkdir(parents=True)
+
+    # Case 1: carrier = 0 (unplugged) -> unbind
+    (iface_dir / "carrier").write_text("0\n", encoding="utf-8")
+    spec = get_workload_profile(WorkloadProfileName.GAMING_PRIME)
+    applied, errors = apply_workload_profile(
+        spec=spec,
+        dry_run=True,
+        sys_root=sys_root,
+        proc_root=proc_root,
+    )
+    assert not errors
+    assert any("drivers/alx/unbind <- 0000:6f:00.0" in item for item in applied)
+
+    # Case 2: carrier = 1 (wired Ethernet connected) -> keep bound
+    (iface_dir / "carrier").write_text("1\n", encoding="utf-8")
+    applied_connected, errors_connected = apply_workload_profile(
+        spec=spec,
+        dry_run=True,
+        sys_root=sys_root,
+        proc_root=proc_root,
+    )
+    assert not errors_connected
+    assert any("carrier=1 (wired link active, kept bound)" in item for item in applied_connected)
+
+
+def test_startup_profile_enable_session_decoupling_and_disable(tmp_path: Path) -> None:
+    """Verify startup profile persistence is decoupled from ephemeral session profile changes."""
+    etc_dir = tmp_path / "etc"
+    run_dir = tmp_path / "run"
+    systemd_dir = tmp_path / "systemd"
+    sleep_dir = tmp_path / "sleep"
+    sleep_dir.mkdir(parents=True)
+
+    # 1. Enable gaming-prime as the startup profile
+    applied, errors = configure_startup_profile(
+        name=WorkloadProfileName.GAMING_PRIME,
+        etc_dir=etc_dir,
+        run_dir=run_dir,
+        systemd_dir=systemd_dir,
+        sleep_dir=sleep_dir,
+    )
+    assert not errors
+    assert any("Startup profile 'gaming-prime' enabled on boot" in item for item in applied)
+
+    status = get_startup_profile_status(
+        etc_dir=etc_dir,
+        run_dir=run_dir,
+        systemd_dir=systemd_dir,
+        sleep_dir=sleep_dir,
+    )
+    assert status.startup_profile == WorkloadProfileName.GAMING_PRIME
+    assert status.session_profile == WorkloadProfileName.GAMING_PRIME
+    assert status.systemd_enabled
+    assert status.sleep_hook_installed
+
+    # 2. Switching session profile without persist_startup updates session_profile only
+    with patch("os.geteuid", return_value=0):
+        daily_spec = get_workload_profile(WorkloadProfileName.BALANCED_DAILY)
+        apply_workload_profile(
+            spec=daily_spec,
+            dry_run=False,
+            sys_root=tmp_path / "sys",
+            proc_root=tmp_path / "proc",
+            persist_startup=False,
+            etc_dir=etc_dir,
+            run_dir=run_dir,
+            systemd_dir=systemd_dir,
+            sleep_dir=sleep_dir,
+        )
+
+    status_after_switch = get_startup_profile_status(
+        etc_dir=etc_dir,
+        run_dir=run_dir,
+        systemd_dir=systemd_dir,
+        sleep_dir=sleep_dir,
+    )
+    assert status_after_switch.startup_profile == WorkloadProfileName.GAMING_PRIME
+    assert status_after_switch.session_profile == WorkloadProfileName.BALANCED_DAILY
+
+    # 3. Disable startup profile
+    d_applied, d_errors = configure_startup_profile(
+        name=None,
+        etc_dir=etc_dir,
+        run_dir=run_dir,
+        systemd_dir=systemd_dir,
+        sleep_dir=sleep_dir,
+    )
+    assert not d_errors
+    assert any("Disabled automatic startup profile loading" in item for item in d_applied)
+
+    status_disabled = get_startup_profile_status(
+        etc_dir=etc_dir,
+        run_dir=run_dir,
+        systemd_dir=systemd_dir,
+        sleep_dir=sleep_dir,
+    )
+    assert status_disabled.startup_profile is None
+    assert not status_disabled.systemd_enabled
+
+

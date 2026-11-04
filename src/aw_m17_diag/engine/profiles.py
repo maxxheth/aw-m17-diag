@@ -8,11 +8,20 @@ from pathlib import Path
 
 from aw_m17_diag.collectors._utils import find_hwmon_by_name, read_int_safe, run_cmd_safe
 from aw_m17_diag.collectors.gpu_display import collect_gpu_display
-from aw_m17_diag.models import WorkloadProfileName, WorkloadProfileSpec
+from aw_m17_diag.models import (
+    StartupProfileStatus,
+    WorkloadProfileName,
+    WorkloadProfileSpec,
+)
 
 _UNCLAMP_KO = Path(
     "/var/www/aw-m17-diag/dkms-candidates/nvidia-s3-power-unclamp/nvidia_power_unclamp.ko"
 )
+_DEFAULT_ETC_DIR = Path("/etc/aw-m17-diag")
+_DEFAULT_RUN_DIR = Path("/run/aw-m17-diag")
+_DEFAULT_SYSTEMD_DIR = Path("/etc/systemd/system")
+_DEFAULT_SLEEP_DIR = Path("/lib/systemd/system-sleep")
+_CLI_BIN = Path("/var/www/aw-m17-diag/.venv/bin/aw-m17-diag")
 
 PROFILES: dict[WorkloadProfileName, WorkloadProfileSpec] = {
     WorkloadProfileName.OLLAMA_HEAVY: WorkloadProfileSpec(
@@ -40,7 +49,8 @@ PROFILES: dict[WorkloadProfileName, WorkloadProfileSpec] = {
             "Optimized for RTX 2070 Max-Q 90W gaming & Steam PRIME offload. "
             "Balances shared CPU/GPU heatpipe with 55W/75W CPU RAPL & balance_performance EPP, "
             "unlocks full 4.50GHz CPU & 90W GPU boost clocks for <16.6ms 60Hz PRIME vblank "
-            "pacing, and clears post-S3-resume 30W / 810MHz NVIDIA clamp."
+            "pacing, unbinds unplugged alx NIC to prevent PCIe MMIO stats stalls, "
+            "and clears post-S3-resume 30W / 810MHz NVIDIA clamp."
         ),
         platform_profile="balanced-performance",
         epp="balance_performance",
@@ -55,6 +65,7 @@ PROFILES: dict[WorkloadProfileName, WorkloadProfileSpec] = {
         gpu_fan_boost=35,
         cpu_max_freq_khz=4_500_000,
         gpu_max_clock_mhz=None,
+        quiesce_unplugged_alx=True,
     ),
     WorkloadProfileName.BALANCED_DAILY: WorkloadProfileSpec(
         name=WorkloadProfileName.BALANCED_DAILY,
@@ -187,46 +198,131 @@ def _unclamp_nvidia_s3_power_state(applied: list[str], errors: list[str]) -> Non
     )
 
 
-def _persist_active_profile(
-    spec: WorkloadProfileSpec, applied: list[str], errors: list[str]
+def _manage_alx_nic(
+    spec: WorkloadProfileSpec,
+    sys_root: Path,
+    applied: list[str],
+    errors: list[str],
+    dry_run: bool,
 ) -> None:
-    """Persist the active workload profile across reboots and S3 sleep/resume cycles."""
-    state_dir = Path("/etc/aw-m17-diag")
-    state_file = state_dir / "active-profile"
-    service_file = Path("/etc/systemd/system/aw-m17-rapl.service")
-    sleep_hook = Path("/lib/systemd/system-sleep/zz-aw-m17-profile")
-    cli_bin = Path("/var/www/aw-m17-diag/.venv/bin/aw-m17-diag")
+    """Unbind unplugged Killer E2500 (alx) in gaming-prime to prevent PCIe MMIO stats stalls.
 
-    if not cli_bin.is_file():
+    In drivers/net/ethernet/atheros/alx/main.c, alx_get_stats64() unconditionally calls
+    alx_update_hw_stats(), which performs 49 synchronous PCIe MMIO reads (ioread32) across
+    the bus on every Netlink RTM_GETLINK / /proc/net/dev query—even when no Ethernet cable
+    is connected (carrier=0) or the interface is DOWN. Under Wine/Proton + Ubisoft Connect
+    (wine_sechost_service polling NSI adapter stats in a tight loop), this burns ~73% of a
+    CPU core in kernel space and tanks framerates to ~14 FPS unless alx is unbound while
+    unplugged.
+    """
+    alx_drv = sys_root / "bus" / "pci" / "drivers" / "alx"
+    pci_devs = sys_root / "bus" / "pci" / "devices"
+    if not alx_drv.is_dir():
         return
 
+    bound_devs = sorted(alx_drv.glob("0000:*"))
+    if spec.quiesce_unplugged_alx:
+        if not bound_devs:
+            if (pci_devs / "0000:6f:00.0").exists():
+                applied.append(
+                    "alx (0000:6f:00.0): already unbound (alx_update_hw_stats MMIO stall prevented)"
+                )
+            return
+
+        for dev_dir in bound_devs:
+            net_dir = dev_dir / "net"
+            ifaces = sorted(net_dir.glob("*")) if net_dir.is_dir() else []
+            has_carrier = any(read_int_safe(iface / "carrier") == 1 for iface in ifaces)
+            iface_label = ifaces[0].name if ifaces else dev_dir.name
+            if has_carrier:
+                applied.append(
+                    f"alx ({dev_dir.name}/{iface_label}): carrier=1 (wired link active, kept bound)"
+                )
+            else:
+                _write_sysfs(alx_drv / "unbind", dev_dir.name, applied, errors, dry_run)
+    else:
+        if not bound_devs and (pci_devs / "0000:6f:00.0").exists():
+            _write_sysfs(alx_drv / "bind", "0000:6f:00.0", applied, errors, dry_run)
+
+
+def _parse_profile_file(path: Path) -> WorkloadProfileName | None:
+    """Read and validate a WorkloadProfileName from a state file."""
+    if not path.is_file():
+        return None
     try:
-        state_dir.mkdir(parents=True, exist_ok=True)
-        state_file.write_text(f"{spec.name.value}\n", encoding="utf-8")
+        raw = path.read_text(encoding="utf-8").strip()
+        return WorkloadProfileName(raw)
+    except (OSError, ValueError):
+        return None
 
-        service_file.write_text(
-            f"""[Unit]
-Description=Apply Alienware m17 (0DG9D5) Active Workload Profile ({spec.name.value})
-After=multi-user.target nvidia-persistenced.service
 
-[Service]
-Type=oneshot
-ExecStart={cli_bin} profile set {spec.name.value}
-RemainAfterExit=yes
+def get_startup_profile_status(
+    etc_dir: Path = _DEFAULT_ETC_DIR,
+    run_dir: Path = _DEFAULT_RUN_DIR,
+    systemd_dir: Path = _DEFAULT_SYSTEMD_DIR,
+    sleep_dir: Path = _DEFAULT_SLEEP_DIR,
+) -> StartupProfileStatus:
+    """Return current startup boot persistence and S3 resume hook configuration."""
+    startup_prof = _parse_profile_file(etc_dir / "startup-profile")
+    if startup_prof is None:
+        startup_prof = _parse_profile_file(etc_dir / "active-profile")
 
-[Install]
-WantedBy=multi-user.target
-""",
-            encoding="utf-8",
-        )
+    session_prof = _parse_profile_file(run_dir / "current-profile") or startup_prof
 
-        if sleep_hook.parent.is_dir():
+    unit_path = systemd_dir / "aw-m17-profile.service"
+    legacy_unit_path = systemd_dir / "aw-m17-rapl.service"
+    active_unit_path = unit_path if unit_path.exists() else legacy_unit_path
+
+    wants_dir = systemd_dir / "multi-user.target.wants"
+    systemd_enabled = (
+        (wants_dir / "aw-m17-profile.service").exists()
+        or (wants_dir / "aw-m17-rapl.service").exists()
+    )
+    if not systemd_enabled and systemd_dir == _DEFAULT_SYSTEMD_DIR and active_unit_path.exists():
+        rc, _ = run_cmd_safe(["systemctl", "is-enabled", "--quiet", active_unit_path.name])
+        systemd_enabled = rc == 0
+
+    sleep_hook = sleep_dir / "zz-aw-m17-profile"
+    sleep_installed = sleep_hook.is_file() and os.access(sleep_hook, os.X_OK)
+
+    return StartupProfileStatus(
+        startup_profile=startup_prof if systemd_enabled else None,
+        session_profile=session_prof,
+        systemd_enabled=systemd_enabled,
+        systemd_unit_path=unit_path,
+        sleep_hook_installed=sleep_installed,
+        sleep_hook_path=sleep_hook,
+    )
+
+
+def _record_session_profile(
+    spec: WorkloadProfileSpec,
+    run_dir: Path,
+    etc_dir: Path,
+    sleep_dir: Path,
+    applied: list[str],
+    errors: list[str],
+) -> None:
+    """Record the active session profile in /run and ensure the S3 sleep hook restores it."""
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        session_file = run_dir / "current-profile"
+        session_file.write_text(f"{spec.name.value}\n", encoding="utf-8")
+
+        sleep_hook = sleep_dir / "zz-aw-m17-profile"
+        if sleep_dir.is_dir() and _CLI_BIN.is_file():
+            startup_file = etc_dir / "startup-profile"
+            legacy_file = etc_dir / "active-profile"
             sleep_hook.write_text(
                 f"""#!/bin/sh
 case "$1" in
     post)
-        if [ -f "{state_file}" ] && [ -x "{cli_bin}" ]; then
-            "{cli_bin}" profile set "$(cat "{state_file}")" >/dev/null 2>&1 || true
+        if [ -f "{session_file}" ] && [ -x "{_CLI_BIN}" ]; then
+            "{_CLI_BIN}" profile set "$(cat "{session_file}")" >/dev/null 2>&1 || true
+        elif [ -f "{startup_file}" ] && [ -x "{_CLI_BIN}" ]; then
+            "{_CLI_BIN}" profile set "$(cat "{startup_file}")" >/dev/null 2>&1 || true
+        elif [ -f "{legacy_file}" ] && [ -x "{_CLI_BIN}" ]; then
+            "{_CLI_BIN}" profile set "$(cat "{legacy_file}")" >/dev/null 2>&1 || true
         fi
         ;;
 esac
@@ -234,15 +330,111 @@ esac
                 encoding="utf-8",
             )
             sleep_hook.chmod(0o755)
+        applied.append(f"Session profile recorded -> {session_file} ({spec.name.value})")
+    except OSError as exc:
+        errors.append(f"session profile tracking: {exc}")
 
-        if not os.environ.get("INVOCATION_ID"):
+
+def configure_startup_profile(
+    name: WorkloadProfileName | str | None,
+    dry_run: bool = False,
+    etc_dir: Path = _DEFAULT_ETC_DIR,
+    run_dir: Path = _DEFAULT_RUN_DIR,
+    systemd_dir: Path = _DEFAULT_SYSTEMD_DIR,
+    sleep_dir: Path = _DEFAULT_SLEEP_DIR,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Enable, update, or disable automatic workload profile loading on system startup."""
+    if not dry_run and os.geteuid() != 0 and systemd_dir == _DEFAULT_SYSTEMD_DIR:
+        return (), ("Root privileges required to configure startup profile (use sudo).",)
+
+    applied: list[str] = []
+    errors: list[str] = []
+
+    startup_file = etc_dir / "startup-profile"
+    legacy_file = etc_dir / "active-profile"
+    unit_file = systemd_dir / "aw-m17-profile.service"
+    legacy_unit = systemd_dir / "aw-m17-rapl.service"
+    wants_dir = systemd_dir / "multi-user.target.wants"
+    sleep_hook = sleep_dir / "zz-aw-m17-profile"
+
+    if name is None:
+        if dry_run:
+            applied.append(f"[DRY-RUN] Disable {unit_file} and remove {startup_file}")
+            return tuple(applied), tuple(errors)
+        try:
+            if systemd_dir == _DEFAULT_SYSTEMD_DIR and not os.environ.get("INVOCATION_ID"):
+                run_cmd_safe(["systemctl", "disable", "aw-m17-profile.service"])
+                run_cmd_safe(["systemctl", "disable", "aw-m17-rapl.service"])
+            for p in (
+                startup_file,
+                legacy_file,
+                unit_file,
+                legacy_unit,
+                wants_dir / "aw-m17-profile.service",
+                wants_dir / "aw-m17-rapl.service",
+            ):
+                if p.exists() or p.is_symlink():
+                    p.unlink()
+            if systemd_dir == _DEFAULT_SYSTEMD_DIR and not os.environ.get("INVOCATION_ID"):
+                run_cmd_safe(["systemctl", "daemon-reload"])
+            applied.append("Disabled automatic startup profile loading (boot service removed)")
+        except OSError as exc:
+            errors.append(f"startup profile disable: {exc}")
+        return tuple(applied), tuple(errors)
+
+    spec = get_workload_profile(name)
+    if dry_run:
+        applied.append(f"[DRY-RUN] {startup_file} <- {spec.name.value}")
+        applied.append(f"[DRY-RUN] {unit_file} <- enable '{spec.name.value}' on boot")
+        return tuple(applied), tuple(errors)
+
+    try:
+        etc_dir.mkdir(parents=True, exist_ok=True)
+        startup_file.write_text(f"{spec.name.value}\n", encoding="utf-8")
+        legacy_file.write_text(f"{spec.name.value}\n", encoding="utf-8")
+
+        systemd_dir.mkdir(parents=True, exist_ok=True)
+        if legacy_unit.exists() or legacy_unit.is_symlink():
+            legacy_unit.unlink()
+
+        unit_file.write_text(
+            f"""[Unit]
+Description=Apply Alienware m17 (0DG9D5) Startup Workload Profile ({spec.name.value})
+After=multi-user.target network.target nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+ExecStart={_CLI_BIN} profile set {spec.name.value}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+Alias=aw-m17-rapl.service
+""",
+            encoding="utf-8",
+        )
+        legacy_unit.symlink_to(unit_file.name)
+
+        wants_dir.mkdir(parents=True, exist_ok=True)
+        for want_name in ("aw-m17-profile.service", "aw-m17-rapl.service"):
+            want_link = wants_dir / want_name
+            if want_link.exists() or want_link.is_symlink():
+                want_link.unlink()
+            want_link.symlink_to(unit_file)
+
+        _record_session_profile(spec, run_dir, etc_dir, sleep_dir, applied, errors)
+
+        if systemd_dir == _DEFAULT_SYSTEMD_DIR and not os.environ.get("INVOCATION_ID"):
             run_cmd_safe(["systemctl", "daemon-reload"])
-            run_cmd_safe(["systemctl", "enable", "aw-m17-rapl.service"])
+            run_cmd_safe(["systemctl", "enable", "aw-m17-profile.service"])
+
         applied.append(
-            f"Persisted '{spec.name.value}' across boot ({service_file}) & S3 resume ({sleep_hook})"
+            f"Startup profile '{spec.name.value}' enabled on boot ({unit_file}) & S3 resume ({sleep_hook})"
         )
     except OSError as exc:
-        errors.append(f"profile persistence: {exc}")
+        errors.append(f"startup profile configuration: {exc}")
+
+    return tuple(applied), tuple(errors)
 
 
 def apply_workload_profile(
@@ -250,6 +442,11 @@ def apply_workload_profile(
     dry_run: bool = False,
     sys_root: Path = Path("/sys"),
     proc_root: Path = Path("/proc"),
+    persist_startup: bool = False,
+    etc_dir: Path = _DEFAULT_ETC_DIR,
+    run_dir: Path = _DEFAULT_RUN_DIR,
+    systemd_dir: Path = _DEFAULT_SYSTEMD_DIR,
+    sleep_dir: Path = _DEFAULT_SLEEP_DIR,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Apply the specified WorkloadProfileSpec to live sysfs/procfs interfaces."""
     if not dry_run and os.geteuid() != 0:
@@ -348,15 +545,18 @@ def apply_workload_profile(
             dry_run,
         )
 
-    # 7. Clear post-S3-resume NVIDIA 30W / 810MHz VRAM battery clamp if active
+    # 7. Unbind unplugged Killer E2500 (alx) in gaming-prime to prevent PCIe MMIO stats stalls
+    _manage_alx_nic(spec, sys_root, applied, errors, dry_run)
+
+    # 8. Clear post-S3-resume NVIDIA 30W / 810MHz VRAM battery clamp if active
     if not dry_run and spec.name in {
         WorkloadProfileName.GAMING_PRIME,
         WorkloadProfileName.OLLAMA_HEAVY,
     }:
         _unclamp_nvidia_s3_power_state(applied, errors)
 
-    # 8. Apply NVIDIA GPU boost clock sweet-spot ceiling (-lgc) or reset (-rgc)
-    if not dry_run:
+    # 9. Apply NVIDIA GPU boost clock sweet-spot ceiling (-lgc) or reset (-rgc)
+    if not dry_run and sys_root == Path("/sys"):
         run_cmd_safe(["nvidia-smi", "-pm", "1"])
         if spec.gpu_max_clock_mhz is not None:
             rc, out = run_cmd_safe(["nvidia-smi", "-lgc", f"300,{spec.gpu_max_clock_mhz}"])
@@ -371,7 +571,19 @@ def apply_workload_profile(
             if rc == 0:
                 applied.append("nvidia-smi -rgc (GPU boost clock range unlocked)")
 
-        if sys_root == Path("/sys"):
-            _persist_active_profile(spec, applied, errors)
+    # 10. Persist startup profile on boot if requested, or record session profile for S3 resume
+    if persist_startup:
+        s_applied, s_errors = configure_startup_profile(
+            name=spec.name,
+            dry_run=dry_run,
+            etc_dir=etc_dir,
+            run_dir=run_dir,
+            systemd_dir=systemd_dir,
+            sleep_dir=sleep_dir,
+        )
+        applied.extend(s_applied)
+        errors.extend(s_errors)
+    elif not dry_run and (sys_root == Path("/sys") or run_dir != _DEFAULT_RUN_DIR):
+        _record_session_profile(spec, run_dir, etc_dir, sleep_dir, applied, errors)
 
     return tuple(applied), tuple(errors)

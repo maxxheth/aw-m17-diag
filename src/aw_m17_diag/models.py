@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 
 
 class Severity(StrEnum):
@@ -197,6 +198,19 @@ class WorkloadProfileSpec:
     gpu_fan_boost: int
     cpu_max_freq_khz: int = 4_500_000
     gpu_max_clock_mhz: int | None = None
+    quiesce_unplugged_alx: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class StartupProfileStatus:
+    """Current boot persistence and S3 resume hook configuration for workload profiles."""
+
+    startup_profile: WorkloadProfileName | None
+    session_profile: WorkloadProfileName | None
+    systemd_enabled: bool
+    systemd_unit_path: Path
+    sleep_hook_installed: bool
+    sleep_hook_path: Path
 
 
 @dataclass(frozen=True, slots=True)

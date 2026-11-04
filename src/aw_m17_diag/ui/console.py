@@ -14,6 +14,7 @@ from aw_m17_diag.models import (
     DriverCandidateAdvisory,
     HealthFinding,
     Severity,
+    StartupProfileStatus,
     SystemAuditReport,
     ThermalPowerSnapshot,
 )
@@ -283,31 +284,95 @@ def render_driver_advisories(
         )
 
 
-def render_profiles_table(tp: ThermalPowerSnapshot) -> None:
+def render_profiles_table(
+    tp: ThermalPowerSnapshot,
+    startup_status: StartupProfileStatus | None = None,
+) -> None:
     """Render available Alienware m17 workload profiles and current live state."""
+    startup_line = ""
+    if startup_status is not None:
+        s_label = (
+            f"[bold green]{startup_status.startup_profile.value}[/bold green] (enabled)"
+            if startup_status.startup_profile is not None
+            else "[yellow]disabled[/yellow]"
+        )
+        sess_label = (
+            f"[bold cyan]{startup_status.session_profile.value}[/bold cyan]"
+            if startup_status.session_profile is not None
+            else "[dim]none[/dim]"
+        )
+        hook_label = (
+            "[green]active[/green]" if startup_status.sleep_hook_installed else "[yellow]missing[/yellow]"
+        )
+        startup_line = (
+            f"\nStartup Boot Profile: {s_label} | "
+            f"Session Profile: {sess_label} | "
+            f"S3 Resume Hook: {hook_label}"
+        )
+
     console.print(
         Panel.fit(
             f"[bold cyan]Alienware m17 Workload Tuning Profiles[/bold cyan]\n"
             f"Live ACPI Profile: [bold]{tp.platform_profile}[/bold] | "
             f"EPP: [bold]{tp.epp}[/bold] | "
             f"MSR PL1/PL2: [bold]{tp.msr_pl1_w}W / {tp.msr_pl2_w}W[/bold] | "
-            f"Fan Boost: [bold]CPU={tp.cpu_fan_boost}, GPU={tp.gpu_fan_boost}[/bold]",
+            f"Fan Boost: [bold]CPU={tp.cpu_fan_boost}, GPU={tp.gpu_fan_boost}[/bold]"
+            f"{startup_line}",
             border_style="cyan",
         )
     )
     table = Table(show_lines=True)
-    table.add_column("Profile Name", style="bold cyan", width=18)
+    table.add_column("Profile Name", style="bold cyan", width=20)
     table.add_column("ACPI / EPP", width=24)
     table.add_column("CPU RAPL (PL1/PL2)", width=18)
     table.add_column("Fan Boost", width=14)
-    table.add_column("Description", width=46)
+    table.add_column("Description", width=44)
 
     for spec in PROFILES.values():
+        badges: list[str] = []
+        if startup_status is not None:
+            if startup_status.startup_profile == spec.name:
+                badges.append("[bold green]★ startup[/bold green]")
+            if startup_status.session_profile == spec.name:
+                badges.append("[cyan]● session[/cyan]")
+        name_cell = spec.name.value
+        if badges:
+            name_cell += "\n" + " ".join(badges)
         table.add_row(
-            spec.name.value,
+            name_cell,
             f"ACPI: {spec.platform_profile}\nEPP:  {spec.epp}",
             f"PL1: {spec.msr_pl1_w}W\nPL2: {spec.msr_pl2_w}W",
             f"CPU: +{spec.cpu_fan_boost}%\nGPU: +{spec.gpu_fan_boost}%",
             spec.description,
         )
     console.print(table)
+
+
+def render_startup_profile_status(status: StartupProfileStatus) -> None:
+    """Render startup boot persistence and S3 resume hook configuration."""
+    boot_badge = (
+        f"[bold green]{status.startup_profile.value}[/bold green] (enabled via {status.systemd_unit_path})"
+        if status.startup_profile is not None and status.systemd_enabled
+        else "[bold yellow]DISABLED[/bold yellow] (no automatic boot profile)"
+    )
+    session_badge = (
+        f"[bold cyan]{status.session_profile.value}[/bold cyan]"
+        if status.session_profile is not None
+        else "[dim]none recorded[/dim]"
+    )
+    sleep_badge = (
+        f"[bold green]INSTALLED[/bold green] ({status.sleep_hook_path})"
+        if status.sleep_hook_installed
+        else f"[bold yellow]NOT INSTALLED[/bold yellow] ({status.sleep_hook_path})"
+    )
+    console.print(
+        Panel.fit(
+            f"[bold cyan]Alienware m17 Startup Profile Configuration[/bold cyan]\n"
+            f"[bold]Startup Boot Profile:[/bold] {boot_badge}\n"
+            f"[bold]Active Session Profile:[/bold] {session_badge}\n"
+            f"[bold]S3 Sleep/Resume Hook:[/bold] {sleep_badge}\n\n"
+            f"[dim]Set startup profile:[/dim]  sudo aw-m17-diag profile startup <name>\n"
+            f"[dim]Disable on startup:[/dim]   sudo aw-m17-diag profile startup --disable",
+            border_style="cyan",
+        )
+    )
