@@ -37,23 +37,24 @@ PROFILES: dict[WorkloadProfileName, WorkloadProfileSpec] = {
     WorkloadProfileName.GAMING_PRIME: WorkloadProfileSpec(
         name=WorkloadProfileName.GAMING_PRIME,
         description=(
-            "Optimized for RTX 2070 Max-Q gaming & Steam PRIME offload. "
-            "Relieves shared heatpipe with 45W/65W CPU RAPL, 3.70GHz CPU turbo cap, "
-            "and 1650MHz GPU V/F sweet-spot ceiling to prevent 87°C VBIOS thermal throttling."
+            "Optimized for RTX 2070 Max-Q 90W gaming & Steam PRIME offload. "
+            "Balances shared CPU/GPU heatpipe with 55W/75W CPU RAPL & balance_performance EPP, "
+            "unlocks full 4.50GHz CPU & 90W GPU boost clocks for <16.6ms 60Hz PRIME vblank "
+            "pacing, and clears post-S3-resume 30W / 810MHz NVIDIA clamp."
         ),
         platform_profile="balanced-performance",
         epp="balance_performance",
-        msr_pl1_w=45,
-        msr_pl2_w=65,
-        mmio_pl1_w=45,
-        mmio_pl2_w=65,
+        msr_pl1_w=55,
+        msr_pl2_w=75,
+        mmio_pl1_w=55,
+        mmio_pl2_w=75,
         swappiness=10,
         dirty_ratio=10,
         dirty_background_ratio=5,
         cpu_fan_boost=35,
         gpu_fan_boost=35,
-        cpu_max_freq_khz=3_700_000,
-        gpu_max_clock_mhz=1650,
+        cpu_max_freq_khz=4_500_000,
+        gpu_max_clock_mhz=None,
     ),
     WorkloadProfileName.BALANCED_DAILY: WorkloadProfileSpec(
         name=WorkloadProfileName.BALANCED_DAILY,
@@ -186,6 +187,64 @@ def _unclamp_nvidia_s3_power_state(applied: list[str], errors: list[str]) -> Non
     )
 
 
+def _persist_active_profile(
+    spec: WorkloadProfileSpec, applied: list[str], errors: list[str]
+) -> None:
+    """Persist the active workload profile across reboots and S3 sleep/resume cycles."""
+    state_dir = Path("/etc/aw-m17-diag")
+    state_file = state_dir / "active-profile"
+    service_file = Path("/etc/systemd/system/aw-m17-rapl.service")
+    sleep_hook = Path("/lib/systemd/system-sleep/zz-aw-m17-profile")
+    cli_bin = Path("/var/www/aw-m17-diag/.venv/bin/aw-m17-diag")
+
+    if not cli_bin.is_file():
+        return
+
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(f"{spec.name.value}\n", encoding="utf-8")
+
+        service_file.write_text(
+            f"""[Unit]
+Description=Apply Alienware m17 (0DG9D5) Active Workload Profile ({spec.name.value})
+After=multi-user.target nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+ExecStart={cli_bin} profile set {spec.name.value}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+""",
+            encoding="utf-8",
+        )
+
+        if sleep_hook.parent.is_dir():
+            sleep_hook.write_text(
+                f"""#!/bin/sh
+case "$1" in
+    post)
+        if [ -f "{state_file}" ] && [ -x "{cli_bin}" ]; then
+            "{cli_bin}" profile set "$(cat "{state_file}")" >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+""",
+                encoding="utf-8",
+            )
+            sleep_hook.chmod(0o755)
+
+        if not os.environ.get("INVOCATION_ID"):
+            run_cmd_safe(["systemctl", "daemon-reload"])
+            run_cmd_safe(["systemctl", "enable", "aw-m17-rapl.service"])
+        applied.append(
+            f"Persisted '{spec.name.value}' across boot ({service_file}) & S3 resume ({sleep_hook})"
+        )
+    except OSError as exc:
+        errors.append(f"profile persistence: {exc}")
+
+
 def apply_workload_profile(
     spec: WorkloadProfileSpec,
     dry_run: bool = False,
@@ -311,5 +370,8 @@ def apply_workload_profile(
             rc, _ = run_cmd_safe(["nvidia-smi", "-rgc"])
             if rc == 0:
                 applied.append("nvidia-smi -rgc (GPU boost clock range unlocked)")
+
+        if sys_root == Path("/sys"):
+            _persist_active_profile(spec, applied, errors)
 
     return tuple(applied), tuple(errors)

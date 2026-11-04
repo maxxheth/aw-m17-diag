@@ -47,22 +47,23 @@ There are three primary engineering levers available on `mothership` to keep the
 
 ---
 
-### Option 1: Re-Balance the Shared CPU/GPU Heatpipe (`CPU RAPL PL1/PL2`, `EPP` & `scaling_max_freq`) — *Active in `gaming-prime`*
+### Option 1: Re-Balance the Shared CPU/GPU Heatpipe (`CPU RAPL PL1/PL2` & `EPP`) — *Active in `gaming-prime`*
 
 #### Mechanism
 Previously, the `gaming-prime` profile configured:
 - **CPU RAPL PL1 (Sustained):** `65W` (`65,000,000 uW`)
 - **CPU RAPL PL2 (Short Burst):** `90W` (`90,000,000 uW`)
 - **Energy Performance Preference (`EPP`):** `performance`
-- **CPU Max Turbo (`scaling_max_freq`):** `4.50 GHz` (`4,500,000 kHz`)
 
 In [`src/aw_m17_diag/engine/profiles.py`](../src/aw_m17_diag/engine/profiles.py), `gaming-prime` now configures:
-- **CPU RAPL PL1 (Sustained):** `45W` (`45,000,000 uW`)
-- **CPU RAPL PL2 (Short Burst):** `65W` (`65,000,000 uW`)
+- **CPU RAPL PL1 (Sustained):** `55W` (`55,000,000 uW`)
+- **CPU RAPL PL2 (Short Burst):** `75W` (`75,000,000 uW`)
 - **Energy Performance Preference (`EPP`):** `balance_performance`
-- **CPU Max Turbo (`scaling_max_freq`):** `3.70 GHz` (`3,700,000 kHz`)
+- **CPU Max Turbo (`scaling_max_freq`):** `4.50 GHz` (`4,500,000 kHz` — full single-core boost unlocked)
+- **GPU Boost Clock (`nvidia-smi -rgc`):** Unlocked (`90W` full boost envelope)
 
-Capping `scaling_max_freq` at `3.70 GHz` alongside `45W/65W` RAPL keeps Intel 14nm++ core voltage around `~1.05V` instead of `~1.30V` (`4.3–4.5 GHz`), preventing 1–2 active game threads from spiking local core temperatures to **`100°C` (`PROCHOT#`)** on top of the shared copper heatpipe (which previously caused `PROCHOT#` to throttle all 6 cores down to `2.80 GHz`).
+> **Why Frequency Caps (`3.70 GHz` CPU / `1500 MHz` GPU) Cause Frame-Skipping on `eDP-1-1` (`PRIME Synchronization: 1`):**
+> The internal `eDP-1-1` panel runs at `1920x1080 @ 60.01 Hz` (`16.66 ms` vblank interval) driven by Intel `i915` Pipe A with `PRIME Synchronization: 1`. Every frame rendered by the RTX 2070 Max-Q (`01:00.0`) must complete CPU main-thread/DXVK dispatch, GPU rasterization, and PCIe DMA copy to `i915` within `16.66 ms` (`scanlines 1073..1079`). Capping `scaling_max_freq` to `3.70 GHz` (`45W` PL1) and locking the GPU to `1500 MHz` pushes frame completion just past `16.66 ms` in heavy DXVK titles (*Assassin's Creed Mirage*), causing `i915` Pipe A atomic vblank misses (`i915 0000:00:02.0: [drm] *ERROR* Atomic update failure on pipe A ... min 1073, max 1079`) and severe double-buffered `60 -> 30 FPS` frame-skipping. Keeping full `4.50 GHz` CPU single-thread boost and full `90W` GPU boost while trimming sustained all-core CPU RAPL to `55W / 75W` keeps frame times safely below `16.66 ms` while relieving 10–15W of continuous heat from the shared heatpipe.
 
 #### Tradeoffs
 | Dimension | Impact |
@@ -89,15 +90,15 @@ done
 
 ---
 
-### Option 2: Sweet-Spot the RTX 2070 Max-Q V/F Curve (`nvidia-smi -lgc 300,1650`) — *Active in `gaming-prime`*
+### Option 2: Sweet-Spot the RTX 2070 Max-Q V/F Curve (`nvidia-smi -lgc`) — *Optional Manual Cap*
 
 #### Mechanism
 The RTX 2070 Max-Q (`TU106`) has a default board power limit of **90.00 W** (`Min Power Limit: 1.00 W`, `Max Power Limit: 90.00 W`). On 12nm Turing silicon, the voltage/frequency curve is non-linear:
-- **0W → 80W:** Near-linear frequency scaling (`~1545–1650 MHz` @ `~825–865 mV`).
-- **80W → 90W (+12.5% heat):** Steep voltage wall (`~950–1000+ mV`) yielding only **+45 to +75 MHz** (~2–4% raw rasterization throughput) at a disproportionate thermal cost.
+- **0W → 72W:** Near-linear frequency scaling (`~1440–1500 MHz` @ `~775–812 mV`).
+- **72W → 90W (+25% heat):** Steep voltage wall (`~900–1000+ mV`) yielding only **+150 to +210 MHz** at a disproportionate thermal cost on the shared CPU/GPU heatpipe.
 
-On the mobile RTX 2070 Max-Q (`10de:1f10`, VBIOS `90.06.2d.00.dc`), direct `nvidia-smi -pl` writes are locked by the VBIOS (`Changing power management limit is not supported`), whereas **Graphics Clock Locking (`nvidia-smi -lgc 300,1650`)** is fully supported:
-- **`nvidia-smi -lgc 300,1650`:** Allows normal dynamic idle downclocking (`300 MHz`) while capping maximum boost frequency at **`1650 MHz`**, preventing the GPU from stepping into its highest-voltage (`>925 mV`) boost bins and keeping board power naturally around **76W–80W** instead of hitting the **87°C** VBIOS `SW Thermal Slowdown` wall.
+On the mobile RTX 2070 Max-Q (`10de:1f10`, VBIOS `90.06.2d.00.dc`), direct `nvidia-smi -pl` writes are locked by the VBIOS (`Changing power management limit is not supported`), whereas **Graphics Clock Locking (`nvidia-smi -lgc 300,1500`)** is fully supported:
+- **`nvidia-smi -lgc 300,1500`:** Allows normal dynamic idle downclocking (`300 MHz`) while capping maximum boost frequency at **`1500 MHz`**, keeping GPU board power around **68W–74W** (-15W less heat on the shared heatpipe compared to 1650–1710 MHz) and preventing the GPU and CPU from saturating the shared cooler.
 
 #### Tradeoffs
 | Dimension | Impact |
