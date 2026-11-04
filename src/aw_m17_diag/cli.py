@@ -39,7 +39,10 @@ app = typer.Typer(
 )
 profile_app = typer.Typer(
     name="profile",
-    help="Inspect or apply Alienware m17 workload tuning profiles (ollama-heavy, gaming-prime, balanced-daily, powersave).",
+    help=(
+        "Inspect or apply Alienware m17 workload tuning profiles "
+        "(extreme-performance, ollama-heavy, gaming-prime, balanced-daily, powersave)."
+    ),
     no_args_is_help=True,
 )
 app.add_typer(profile_app, name="profile")

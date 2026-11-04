@@ -29,9 +29,14 @@ uv run aw-m17-diag preflight --workload ollama --model-size-gb 22
 # Evaluate Tier 1 (Sysfs) vs Tier 2 (Boot Param) vs Tier 3 (Custom DKMS Driver) solutions
 uv run aw-m17-diag driver-advisor --export-dkms
 
-# View or apply workload profiles (ollama-heavy, gaming-prime, balanced-daily, powersave)
+# View or apply workload profiles (extreme-performance, ollama-heavy, gaming-prime, balanced-daily, powersave)
 uv run aw-m17-diag profile show
-sudo $(which uv) run aw-m17-diag profile set ollama-heavy
+sudo $(which uv) run aw-m17-diag profile set gaming-prime
+
+# Configure or inspect the profile loaded automatically on system startup
+uv run aw-m17-diag profile startup --status
+sudo $(which uv) run aw-m17-diag profile startup gaming-prime
+sudo $(which uv) run aw-m17-diag profile startup --disable
 
 # Live real-time hardware & minefield telemetry dashboard
 uv run aw-m17-diag watch

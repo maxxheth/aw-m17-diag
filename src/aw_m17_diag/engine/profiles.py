@@ -24,6 +24,28 @@ _DEFAULT_SLEEP_DIR = Path("/lib/systemd/system-sleep")
 _CLI_BIN = Path("/var/www/aw-m17-diag/.venv/bin/aw-m17-diag")
 
 PROFILES: dict[WorkloadProfileName, WorkloadProfileSpec] = {
+    WorkloadProfileName.EXTREME_PERFORMANCE: WorkloadProfileSpec(
+        name=WorkloadProfileName.EXTREME_PERFORMANCE,
+        description=(
+            "Maximum zero-compromise CPU + GPU performance. Pins all CPU cores to peak turbo "
+            "with performance EPP (0x00) and 70W/90W RAPL, unlocks full 4.50GHz CPU & 90W GPU "
+            "boost clocks, unbinds unplugged alx NIC, and clears post-S3 30W NVIDIA clamp."
+        ),
+        platform_profile="balanced-performance",
+        epp="performance",
+        msr_pl1_w=70,
+        msr_pl2_w=90,
+        mmio_pl1_w=70,
+        mmio_pl2_w=90,
+        swappiness=10,
+        dirty_ratio=10,
+        dirty_background_ratio=5,
+        cpu_fan_boost=50,
+        gpu_fan_boost=50,
+        cpu_max_freq_khz=4_500_000,
+        gpu_max_clock_mhz=None,
+        quiesce_unplugged_alx=True,
+    ),
     WorkloadProfileName.OLLAMA_HEAVY: WorkloadProfileSpec(
         name=WorkloadProfileName.OLLAMA_HEAVY,
         description=(
@@ -550,6 +572,7 @@ def apply_workload_profile(
 
     # 8. Clear post-S3-resume NVIDIA 30W / 810MHz VRAM battery clamp if active
     if not dry_run and spec.name in {
+        WorkloadProfileName.EXTREME_PERFORMANCE,
         WorkloadProfileName.GAMING_PRIME,
         WorkloadProfileName.OLLAMA_HEAVY,
     }:

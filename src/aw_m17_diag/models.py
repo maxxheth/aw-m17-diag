@@ -27,6 +27,7 @@ class RemediationTier(StrEnum):
 class WorkloadProfileName(StrEnum):
     """Supported Alienware m17 tuning profiles."""
 
+    EXTREME_PERFORMANCE = "extreme-performance"
     OLLAMA_HEAVY = "ollama-heavy"
     GAMING_PRIME = "gaming-prime"
     BALANCED_DAILY = "balanced-daily"

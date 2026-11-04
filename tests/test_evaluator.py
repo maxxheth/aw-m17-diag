@@ -292,3 +292,28 @@ def test_startup_profile_enable_session_decoupling_and_disable(tmp_path: Path) -
     assert not status_disabled.systemd_enabled
 
 
+def test_extreme_performance_profile_applies_performance_epp_and_70w_rapl(
+    tmp_path: Path,
+) -> None:
+    """Verify extreme-performance sets epp=performance, 70W/90W RAPL, and unbinds unplugged alx."""
+    sys_root = tmp_path / "sys"
+    proc_root = tmp_path / "proc"
+    cpu0 = sys_root / "devices" / "system" / "cpu" / "cpu0" / "cpufreq"
+    cpu0.mkdir(parents=True)
+    (cpu0 / "energy_performance_preference").write_text("balance_performance\n", encoding="utf-8")
+    (cpu0 / "scaling_max_freq").write_text("4500000\n", encoding="utf-8")
+
+    spec = get_workload_profile(WorkloadProfileName.EXTREME_PERFORMANCE)
+    applied, errors = apply_workload_profile(
+        spec=spec,
+        dry_run=True,
+        sys_root=sys_root,
+        proc_root=proc_root,
+    )
+    assert not errors
+    assert any("energy_performance_preference <- performance" in item for item in applied)
+    assert any("constraint_0_power_limit_uw <- 70000000" in item for item in applied)
+    assert any("constraint_1_power_limit_uw <- 90000000" in item for item in applied)
+
+
+

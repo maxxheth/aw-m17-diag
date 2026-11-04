@@ -215,14 +215,15 @@ You can manage whether a workload profile loads for the current session only or 
 
 ```bash
 # Apply a profile for the current session only (does not alter boot startup profile):
-sudo aw-m17-diag profile set gaming-prime
+sudo $(which uv) run aw-m17-diag profile set gaming-prime
+sudo $(which uv) run aw-m17-diag profile set extreme-performance
 
 # Apply a profile AND set it to load automatically on system startup:
-sudo aw-m17-diag profile set gaming-prime --startup
+sudo $(which uv) run aw-m17-diag profile set gaming-prime --startup
 
 # Dedicated startup profile management:
-aw-m17-diag profile startup --status
-sudo aw-m17-diag profile startup gaming-prime
-sudo aw-m17-diag profile startup --disable
+uv run aw-m17-diag profile startup --status
+sudo $(which uv) run aw-m17-diag profile startup gaming-prime
+sudo $(which uv) run aw-m17-diag profile startup --disable
 ```
 
