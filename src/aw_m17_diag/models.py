@@ -203,6 +203,32 @@ class WorkloadProfileSpec:
     gpu_vf_offset_mhz: int = 0
     quiesce_unplugged_alx: bool = False
 
+    def __post_init__(self) -> None:
+        """Enforce hardware-safe domain invariants on profile parameters."""
+        if not (0 <= self.cpu_fan_boost <= 100 and 0 <= self.gpu_fan_boost <= 100):
+            raise ValueError(
+                f"AWCC fan boost must stay within 0..100% SetAddonSpeedPercent domain "
+                f"(got cpu={self.cpu_fan_boost}, gpu={self.gpu_fan_boost})."
+            )
+        if not (0 < self.msr_pl1_w <= self.msr_pl2_w and 0 < self.mmio_pl1_w <= self.mmio_pl2_w):
+            raise ValueError(
+                f"RAPL PL1 must be positive and <= PL2 "
+                f"(MSR {self.msr_pl1_w}/{self.msr_pl2_w}W, MMIO {self.mmio_pl1_w}/{self.mmio_pl2_w}W)."
+            )
+        if not (0 <= self.gpu_vf_offset_mhz <= 250 and self.gpu_vf_offset_mhz % 15 == 0):
+            raise ValueError(
+                f"Turing GPC V/F offset must be a non-negative multiple of 15 MHz <= 250 MHz "
+                f"(got {self.gpu_vf_offset_mhz} MHz)."
+            )
+        if self.gpu_vf_offset_mhz > 0 and (
+            self.gpu_max_clock_mhz is None
+            or not (300 <= self.gpu_max_clock_mhz <= 1800 and self.gpu_max_clock_mhz % 15 == 0)
+        ):
+            raise ValueError(
+                "Positive GPU V/F undervolt offset requires an explicit 15 MHz-aligned "
+                f"gpu_max_clock_mhz ceiling in 300..1800 MHz (got {self.gpu_max_clock_mhz})."
+            )
+
 
 @dataclass(frozen=True, slots=True)
 class StartupProfileStatus:

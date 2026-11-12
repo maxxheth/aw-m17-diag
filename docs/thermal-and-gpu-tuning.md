@@ -55,12 +55,14 @@ Previously, the `gaming-prime` profile configured:
 - **CPU RAPL PL2 (Short Burst):** `90W` (`90,000,000 uW`)
 - **Energy Performance Preference (`EPP`):** `performance`
 
-In [`src/aw_m17_diag/engine/profiles.py`](../src/aw_m17_diag/engine/profiles.py), `gaming-prime` now configures:
-- **CPU RAPL PL1 (Sustained):** `55W` (`55,000,000 uW`)
-- **CPU RAPL PL2 (Short Burst):** `75W` (`75,000,000 uW`)
+In [`src/aw_m17_diag/engine/profiles.py`](../src/aw_m17_diag/engine/profiles.py), `gaming-prime` now enforces these core configuration invariants:
+- **AWCC Platform Profile (`/sys/class/platform-profile/platform-profile-0/profile`):** `custom` (`0x00`)
+- **Exhaust Fan Curve Boost (`fan1_boost` / `fan2_boost`):** `+100%` / `+100%` (clamped strictly to `0..100%` `SetAddonSpeedPercent` domain; zeroed automatically before transitioning back to preset profiles)
+- **CPU RAPL PL1 (Sustained):** `38W` (`38,000,000 uW`)
+- **CPU RAPL PL2 (Short Burst):** `60W` (`60,000,000 uW`)
 - **Energy Performance Preference (`EPP`):** `balance_performance`
 - **CPU Max Turbo (`scaling_max_freq`):** `4.50 GHz` (`4,500,000 kHz` — full single-core boost unlocked)
-- **GPU Boost Clock (`nvidia-smi -rgc`):** Unlocked (`90W` full boost envelope)
+- **GPU NVML V/F Undervolt + Boost Ceiling:** `+135 MHz` GPC V/F offset (`nvmlDeviceSetGpcClkVfOffset`) paired with `nvidia-smi -lgc 300,1560` (`1,560 MHz` running at the `~1,425 MHz` voltage step — 2 Turing `15 MHz` PLL bins of $V_{\min}$ guardband below `+165 MHz`, which triggered `NVRM: Xid 109 (CTX SWITCH TIMEOUT)` after 73 minutes of DX12/`vkd3d-proton` load)
 
 > **Why Frequency Caps (`3.70 GHz` CPU / `1500 MHz` GPU) Cause Frame-Skipping on `eDP-1-1` (`PRIME Synchronization: 1`):**
 > The internal `eDP-1-1` panel runs at `1920x1080 @ 60.01 Hz` (`16.66 ms` vblank interval) driven by Intel `i915` Pipe A with `PRIME Synchronization: 1`. Every frame rendered by the RTX 2070 Max-Q (`01:00.0`) must complete CPU main-thread/DXVK dispatch, GPU rasterization, and PCIe DMA copy to `i915` within `16.66 ms` (`scanlines 1073..1079`). Capping `scaling_max_freq` to `3.70 GHz` (`45W` PL1) and locking the GPU to `1500 MHz` pushes frame completion just past `16.66 ms` in heavy DXVK titles (*Assassin's Creed Mirage*), causing `i915` Pipe A atomic vblank misses (`i915 0000:00:02.0: [drm] *ERROR* Atomic update failure on pipe A ... min 1073, max 1079`) and severe double-buffered `60 -> 30 FPS` frame-skipping. Keeping full `4.50 GHz` CPU single-thread boost and full `90W` GPU boost while trimming sustained all-core CPU RAPL to `55W / 75W` keeps frame times safely below `16.66 ms` while relieving 10–15W of continuous heat from the shared heatpipe.
@@ -127,17 +129,17 @@ sudo nvidia-smi -rgc
 
 ---
 
-### Option 3: Kernel-Space AWCC `custom` (`0x00`) Mode to Unlock Manual `fan1_boost` / `fan2_boost`
+### Option 3: Per-Driver `platform-profile-0` `custom` (`0x00`) Mode to Unlock `+100%` `fan1_boost` / `fan2_boost` — *Active in `gaming-prime`*
 
 #### Mechanism & Firmware Constraints
-On the Alienware m17 (`0DG9D5`), `alienware-wmi.ko` exposes `/sys/class/hwmon/hwmon*/fan1_boost` and `fan2_boost` backed by WMI method `0x15` (`AWCC_METHOD_THERMAL_CONTROL`, operation `0x02` = `AWCC_OP_SET_FAN_BOOST`). However, two layers prevent standard userspace tools from setting manual fan boost:
+On the Alienware m17 (`0DG9D5`), `alienware-wmi.ko` exposes `/sys/class/hwmon/hwmon*/fan1_boost` and `fan2_boost` backed by WMI method `0x15` (`AWCC_METHOD_THERMAL_CONTROL`, operation `0x02` = `AWCC_OP_SET_FAN_BOOST` / AWCC `SetAddonSpeedPercent`). Two kernel/firmware rules govern this interface:
 
 1. **Alienware EC Preset Lock (`-EBADRQC` / `Errno 56`):**
-   Whenever the Embedded Controller (EC) is in an automatic thermal preset (`cool` = `0xA2`, `quiet` = `0x96`, `balanced` = `0xA0`, or `balanced-performance` = `0xA1`), the EC governs fan PWM curves internally and rejects WMI `0x15` op `0x02` (`AWCC_OP_SET_FAN_BOOST`) with `0xffffffff`, which `awcc_wmi_command()` translates into `-EBADRQC` (`[Errno 56] Invalid request code`).
-2. **Linux `platform_profile.c` Userspace Filter (`-EINVAL` / `Errno 22`):**
-   Although `/sys/firmware/acpi/platform_profile_choices` advertises `custom` (`PLATFORM_PROFILE_CUSTOM` = `7`, which maps to WMI `0x15` op `0x01` arg `0x00` inside `alienware-wmi.ko`), the generic kernel handler `platform_profile_store()` in `drivers/acpi/platform_profile.c` treats `custom` as a read-only reporting state and returns `-EINVAL` (`[Errno 22] Invalid argument`) if userspace writes `"custom"` to `/sys/firmware/acpi/platform_profile`.
-
-To unlock manual `fan1_boost` / `fan2_boost` pre-staging (e.g., spinning fans to 85–100% *before* the heatsink reaches 80°C), a kernel module or WMI helper must invoke WMI `0x15` op `0x01` arg `0x00` (`AWCC_PROFILE_CUSTOM`) directly in kernel space.
+   Whenever the Embedded Controller (EC) is in an automatic thermal preset (`cool` = `0xA2`, `quiet` = `0xA3`, `balanced` = `0xA0`, or `balanced-performance` = `0xA1`), the EC governs fan PWM curves internally (capping `fan2` around `~3,811 RPM` / `~85%` under gaming load) and rejects WMI `0x15` op `0x02` with `0xffffffff` (`-EBADRQC`).
+2. **Legacy `/sys/firmware/acpi/platform_profile` vs. Per-Driver `/sys/class/platform-profile/platform-profile-0/profile`:**
+   In Linux 6.14+ / 7.0 (`drivers/acpi/platform_profile.c`), legacy global `platform_profile_store()` (`/sys/firmware/acpi/platform_profile`) explicitly blocks userspace writes of `"custom"` (`if (i == PLATFORM_PROFILE_CUSTOM) return -EINVAL`), whereas the per-driver class device `profile_store()` at `/sys/class/platform-profile/platform-profile-0/profile` (`name = alienware-wmi`) **natively accepts `"custom"` in userspace** under `&profile_lock` with zero out-of-tree WMI kernel modules required.
+3. **Strict `0..100%` `SetAddonSpeedPercent` Domain & Ordered Transitions:**
+   AWCC firmware interprets the `fan*_boost` byte as a `0..100%` curve offset (`SetAddonSpeedPercent`). Passing out-of-domain values (`> 100`, e.g., `200`) or leaving non-zero boost latched when switching back to a preset profile can trip the WMAX EC watchdog. `WorkloadProfileSpec` and `write_fan_boost()` enforce `0 <= boost <= 100` as a hard invariant, and `_apply_platform_profile_and_fans()` zeroes `fan1_boost` / `fan2_boost` before exiting `custom` mode.
 
 > **Critical Firmware Caveat on `0DG9D5`:**
 > On this laptop, the EC's thermal profile byte also governs the ACPI D-Notifier level (`0xD1`–`0xD5`) sent to the NVIDIA GPU and the EC's internal PECI/PL4 limits. `balanced-performance` (`0xA1`, the AWCC G-Mode / high-performance table) is guaranteed to permit full 90W GPU operation. If switching the EC to `0x00` (`AWCC_PROFILE_CUSTOM`) causes the EC to drop its internal fan/power table or assert `0xD2` D-Notifier capping, `nvidia_power_unclamp.ko` must be run immediately afterward to ensure the GPU remains unclamped at 90W.

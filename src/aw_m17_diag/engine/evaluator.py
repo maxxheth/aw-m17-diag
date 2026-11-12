@@ -12,6 +12,14 @@ from aw_m17_diag.collectors.pcie_iommu import collect_pcie_iommu
 from aw_m17_diag.collectors.storage import collect_storage
 from aw_m17_diag.collectors.thermal_power import collect_thermal_power
 from aw_m17_diag.engine.driver_advisor import evaluate_driver_candidates
+from aw_m17_diag.engine.profiles import (
+    GAMING_PRIME_FAN_BOOST_PCT,
+    GAMING_PRIME_GPU_MAX_CLOCK_MHZ,
+    GAMING_PRIME_GPU_VF_OFFSET_MHZ,
+    GAMING_PRIME_PL1_W,
+    GAMING_PRIME_PL2_W,
+    GAMING_PRIME_PLATFORM_PROFILE,
+)
 from aw_m17_diag.models import (
     GpuDisplaySnapshot,
     HealthFinding,
@@ -515,10 +523,50 @@ def evaluate_preflight(
                     f"VRAM={report.gpu_display.gpu_clock_mem_mhz} MHz, "
                     f"Profile={report.thermal_power.platform_profile}"
                 ),
-                expected_value="Cap=90.0W (P0 / 6001 MHz under load), Profile!='balanced-performance'",
+                expected_value="Cap=90.0W (P0 / 6001 MHz under load), SW_Therm_Slowdown=False",
                 explanation=(
                     "Detects the 30W / P5 (810 MHz VRAM) ACPI SW Thermal Slowdown clamp caused by "
-                    "WMI profile 0xA1 ('balanced-performance') or S3 sleep/resume state."
+                    "post-S3 sleep/resume _PSR=0 AC race."
+                ),
+                remediation_tier=RemediationTier.TIER_1_USERSPACE_SYSFS,
+                remediation_cmd="sudo $(which uv) run aw-m17-diag profile set gaming-prime",
+            )
+        )
+        tp = report.thermal_power
+        gd = report.gpu_display
+        invariants_active = (
+            tp.platform_profile == GAMING_PRIME_PLATFORM_PROFILE
+            and tp.cpu_fan_boost == GAMING_PRIME_FAN_BOOST_PCT
+            and tp.gpu_fan_boost == GAMING_PRIME_FAN_BOOST_PCT
+            and tp.msr_pl1_w is not None
+            and abs(tp.msr_pl1_w - GAMING_PRIME_PL1_W) <= 0.5
+            and gd.gpu_vf_offset_mhz == GAMING_PRIME_GPU_VF_OFFSET_MHZ
+        )
+        checks.append(
+            HealthFinding(
+                check_id="PRE-GAME-INV",
+                subsystem="gaming-prime Invariants",
+                title=(
+                    f"Exhaust Fan Boost (+{GAMING_PRIME_FAN_BOOST_PCT}%), "
+                    f"NVML Undervolt (+{GAMING_PRIME_GPU_VF_OFFSET_MHZ}MHz) & "
+                    f"{GAMING_PRIME_PL1_W}W/{GAMING_PRIME_PL2_W}W RAPL"
+                ),
+                severity=Severity.PASS if invariants_active else Severity.WARN,
+                current_value=(
+                    f"Profile={tp.platform_profile}, "
+                    f"FanBoost={tp.cpu_fan_boost}/{tp.gpu_fan_boost}%, "
+                    f"PL1/PL2={tp.msr_pl1_w}/{tp.msr_pl2_w}W, "
+                    f"UV={gd.gpu_vf_offset_mhz or 0:+d}MHz"
+                ),
+                expected_value=(
+                    f"Profile={GAMING_PRIME_PLATFORM_PROFILE}, "
+                    f"FanBoost={GAMING_PRIME_FAN_BOOST_PCT}/{GAMING_PRIME_FAN_BOOST_PCT}%, "
+                    f"PL1/PL2={GAMING_PRIME_PL1_W}/{GAMING_PRIME_PL2_W}W, "
+                    f"UV=+{GAMING_PRIME_GPU_VF_OFFSET_MHZ}MHz @ <={GAMING_PRIME_GPU_MAX_CLOCK_MHZ}MHz"
+                ),
+                explanation=(
+                    "Enforces gaming-prime core thermal invariants to keep 60+ min sustained "
+                    "GPU temperatures in the mid-70s°C without 87°C VBIOS throttling."
                 ),
                 remediation_tier=RemediationTier.TIER_1_USERSPACE_SYSFS,
                 remediation_cmd="sudo $(which uv) run aw-m17-diag profile set gaming-prime",

@@ -5,10 +5,17 @@ from __future__ import annotations
 import ctypes
 import errno
 import os
+import platform
 from pathlib import Path
 
-from aw_m17_diag.collectors._utils import find_hwmon_by_name, read_int_safe, run_cmd_safe
+from aw_m17_diag.collectors._utils import (
+    find_hwmon_by_name,
+    read_int_safe,
+    read_text_safe,
+    run_cmd_safe,
+)
 from aw_m17_diag.collectors.gpu_display import collect_gpu_display
+from aw_m17_diag.collectors.thermal_power import collect_thermal_power
 from aw_m17_diag.models import (
     StartupProfileStatus,
     WorkloadProfileName,
@@ -23,6 +30,15 @@ _DEFAULT_RUN_DIR = Path("/run/aw-m17-diag")
 _DEFAULT_SYSTEMD_DIR = Path("/etc/systemd/system")
 _DEFAULT_SLEEP_DIR = Path("/lib/systemd/system-sleep")
 _CLI_BIN = Path("/var/www/aw-m17-diag/.venv/bin/aw-m17-diag")
+
+# Core configuration invariants for the gaming-prime workload profile (Options A + B)
+GAMING_PRIME_PLATFORM_PROFILE = "custom"
+GAMING_PRIME_FAN_BOOST_PCT = 100
+GAMING_PRIME_PL1_W = 38
+GAMING_PRIME_PL2_W = 60
+GAMING_PRIME_CPU_MAX_FREQ_KHZ = 4_500_000
+GAMING_PRIME_GPU_MAX_CLOCK_MHZ = 1560
+GAMING_PRIME_GPU_VF_OFFSET_MHZ = 135
 
 PROFILES: dict[WorkloadProfileName, WorkloadProfileSpec] = {
     WorkloadProfileName.EXTREME_PERFORMANCE: WorkloadProfileSpec(
@@ -69,24 +85,25 @@ PROFILES: dict[WorkloadProfileName, WorkloadProfileSpec] = {
     WorkloadProfileName.GAMING_PRIME: WorkloadProfileSpec(
         name=WorkloadProfileName.GAMING_PRIME,
         description=(
-            "Cool & sustained 60Hz PRIME gaming with native NVML GPU undervolt (+135MHz V/F "
-            "offset @ 1590MHz ceiling) and 45W/65W shared-heatpipe RAPL relief (4.50GHz "
-            "single-core boost preserved). Unbinds unplugged alx NIC and clears S3 30W clamp."
+            "Cool & sustained 60Hz PRIME gaming enforcing core thermal invariants: AWCC 'custom' "
+            "profile with +100% CPU/GPU exhaust fan boost, native NVML GPU undervolt (+135MHz V/F "
+            "offset @ 1560MHz ceiling), and 38W/60W shared-heatpipe RAPL relief (4.50GHz "
+            "single-core boost preserved, unplugged alx unbound, S3 30W clamp cleared)."
         ),
-        platform_profile="balanced-performance",
+        platform_profile=GAMING_PRIME_PLATFORM_PROFILE,
         epp="balance_performance",
-        msr_pl1_w=45,
-        msr_pl2_w=65,
-        mmio_pl1_w=45,
-        mmio_pl2_w=65,
+        msr_pl1_w=GAMING_PRIME_PL1_W,
+        msr_pl2_w=GAMING_PRIME_PL2_W,
+        mmio_pl1_w=GAMING_PRIME_PL1_W,
+        mmio_pl2_w=GAMING_PRIME_PL2_W,
         swappiness=10,
         dirty_ratio=10,
         dirty_background_ratio=5,
-        cpu_fan_boost=35,
-        gpu_fan_boost=35,
-        cpu_max_freq_khz=4_500_000,
-        gpu_max_clock_mhz=1590,
-        gpu_vf_offset_mhz=135,
+        cpu_fan_boost=GAMING_PRIME_FAN_BOOST_PCT,
+        gpu_fan_boost=GAMING_PRIME_FAN_BOOST_PCT,
+        cpu_max_freq_khz=GAMING_PRIME_CPU_MAX_FREQ_KHZ,
+        gpu_max_clock_mhz=GAMING_PRIME_GPU_MAX_CLOCK_MHZ,
+        gpu_vf_offset_mhz=GAMING_PRIME_GPU_VF_OFFSET_MHZ,
         quiesce_unplugged_alx=True,
     ),
     WorkloadProfileName.BALANCED_DAILY: WorkloadProfileSpec(
@@ -148,6 +165,26 @@ def _write_sysfs(
         errors.append(f"{path}: {exc}")
 
 
+def _find_alienware_platform_profile_file(sys_root: Path) -> Path | None:
+    """Locate the per-driver class attribute /sys/class/platform-profile/platform-profile-*/profile.
+
+    In Linux 6.14+ / 7.0 (drivers/acpi/platform_profile.c), legacy
+    /sys/firmware/acpi/platform_profile explicitly rejects userspace writes of
+    "custom" (PLATFORM_PROFILE_CUSTOM) with -EINVAL, whereas the per-driver class
+    interface /sys/class/platform-profile/platform-profile-0/profile exported by
+    alienware-wmi natively accepts "custom" under profile_lock.
+    """
+    pprof_class = sys_root / "class" / "platform-profile"
+    if not pprof_class.is_dir():
+        return None
+    for dev_dir in sorted(pprof_class.glob("platform-profile-*")):
+        if read_text_safe(dev_dir / "name") == "alienware-wmi":
+            prof_file = dev_dir / "profile"
+            if prof_file.exists():
+                return prof_file
+    return None
+
+
 def write_fan_boost(
     path: Path,
     boost: int,
@@ -156,27 +193,27 @@ def write_fan_boost(
     errors: list[str],
     dry_run: bool,
 ) -> None:
-    """Write Alienware WMI fan*_boost, handling firmware EBADRQC (Errno 56) under preset profiles.
+    """Write Alienware WMI fan*_boost (clamped to 0..100%), handling EBADRQC under presets.
 
-    On Alienware WMAX/AWCC firmware (such as 0DG9D5 BIOS 2.21.1), invoking WMI
-    Thermal_Control (0x15) op 0x02 (AWCC_OP_SET_FAN_BOOST) while a preset ACPI
-    platform_profile ('balanced-performance', 'balanced', 'quiet', 'cool') is active
-    causes the EC to return AWCC_FAILURE_CODE (0xFFFFFFFF), which alienware-wmi-wmax
-    translates to -EBADRQC ([Errno 56] Invalid request code) because manual fan boost
-    overrides are locked unless platform_profile is 'custom' (0x00).
+    On Alienware WMAX/AWCC firmware (0DG9D5 BIOS 2.21.1), WMI Thermal_Control (0x15)
+    op 0x02 implements AWCC SetAddonSpeedPercent (0..100%). Invoking it while a preset
+    profile ('balanced-performance', 'balanced', 'quiet', 'cool') is active returns
+    AWCC_FAILURE_CODE (0xFFFFFFFF -> -EBADRQC / Errno 56); manual boost requires
+    platform_profile == 'custom' (0x00) and values strictly in 0..100.
     """
+    clamped = max(0, min(100, boost))
     if dry_run:
-        applied.append(f"[DRY-RUN] {path} <- {boost}")
+        applied.append(f"[DRY-RUN] {path} <- {clamped}")
         return
 
     current = read_int_safe(path)
-    if boost == 0 and current == 0:
+    if clamped == 0 and current == 0:
         applied.append(f"{path} == 0 (EC auto-curve active)")
         return
 
     try:
-        path.write_text(f"{boost}\n", encoding="utf-8")
-        applied.append(f"{path} <- {boost}")
+        path.write_text(f"{clamped}\n", encoding="utf-8")
+        applied.append(f"{path} <- {clamped}")
     except OSError as exc:
         if exc.errno == errno.EBADRQC:
             applied.append(
@@ -185,6 +222,83 @@ def write_fan_boost(
             )
         else:
             errors.append(f"{path}: {exc}")
+
+
+def _apply_platform_profile_and_fans(
+    spec: WorkloadProfileSpec,
+    sys_root: Path,
+    applied: list[str],
+    errors: list[str],
+    dry_run: bool,
+) -> None:
+    """Safely sequence AWCC platform_profile and fan1_boost/fan2_boost transitions.
+
+    - Entering 'custom': switches /sys/class/platform-profile/platform-profile-0/profile
+      to 'custom' first, then applies clamped 0..100% fan1_boost / fan2_boost.
+    - Leaving 'custom' for a preset profile: zeroes fan1_boost / fan2_boost FIRST while
+      still in 'custom' so no non-zero SetAddonSpeedPercent remains latched in EC RAM,
+      then activates the target preset profile.
+    """
+    aw_pprof = _find_alienware_platform_profile_file(sys_root)
+    acpi_prof = sys_root / "firmware" / "acpi" / "platform_profile"
+    aw_hwmon = find_hwmon_by_name("alienware_wmi", sys_root / "class" / "hwmon")
+
+    live_profile = read_text_safe(aw_pprof if aw_pprof is not None else acpi_prof)
+
+    if spec.platform_profile == "custom":
+        target_prof_path = aw_pprof if aw_pprof is not None else acpi_prof
+        if target_prof_path.exists() or dry_run:
+            _write_sysfs(target_prof_path, "custom", applied, errors, dry_run)
+        if aw_hwmon is not None:
+            write_fan_boost(
+                aw_hwmon / "fan1_boost",
+                spec.cpu_fan_boost,
+                "custom",
+                applied,
+                errors,
+                dry_run,
+            )
+            write_fan_boost(
+                aw_hwmon / "fan2_boost",
+                spec.gpu_fan_boost,
+                "custom",
+                applied,
+                errors,
+                dry_run,
+            )
+        elif dry_run:
+            applied.append(f"[DRY-RUN] alienware_wmi fan1_boost <- {spec.cpu_fan_boost}")
+            applied.append(f"[DRY-RUN] alienware_wmi fan2_boost <- {spec.gpu_fan_boost}")
+        return
+
+    # Transitioning to a preset profile ('balanced-performance', 'balanced', 'quiet', 'cool')
+    zeroed_before_switch = False
+    if aw_hwmon is not None and live_profile == "custom":
+        write_fan_boost(aw_hwmon / "fan1_boost", 0, "custom", applied, errors, dry_run)
+        write_fan_boost(aw_hwmon / "fan2_boost", 0, "custom", applied, errors, dry_run)
+        zeroed_before_switch = True
+
+    target_prof_path = aw_pprof if aw_pprof is not None else acpi_prof
+    if target_prof_path.exists() or dry_run:
+        _write_sysfs(target_prof_path, spec.platform_profile, applied, errors, dry_run)
+
+    if aw_hwmon is not None and not (zeroed_before_switch and spec.cpu_fan_boost == 0 and spec.gpu_fan_boost == 0):
+        write_fan_boost(
+            aw_hwmon / "fan1_boost",
+            spec.cpu_fan_boost,
+            spec.platform_profile,
+            applied,
+            errors,
+            dry_run,
+        )
+        write_fan_boost(
+            aw_hwmon / "fan2_boost",
+            spec.gpu_fan_boost,
+            spec.platform_profile,
+            applied,
+            errors,
+            dry_run,
+        )
 
 
 def _apply_nvml_vf_offset(
@@ -240,6 +354,16 @@ def _apply_nvml_vf_offset(
         nvml.nvmlShutdown()
 
 
+def _ko_matches_running_kernel(ko_path: Path) -> bool:
+    """Return True if ko_path exists and its vermagic matches platform.release()."""
+    if not ko_path.is_file():
+        return False
+    rc, out = run_cmd_safe(["modinfo", "-F", "vermagic", str(ko_path)])
+    if rc != 0:
+        return False
+    return out.strip().startswith(f"{platform.release()} ")
+
+
 def _unclamp_nvidia_s3_power_state(applied: list[str], errors: list[str]) -> None:
     """Clear the NVIDIA RTX 2070 Max-Q post-S3-resume 30W / P5 (810 MHz) battery clamp."""
     gpu = collect_gpu_display(klog="")
@@ -249,8 +373,8 @@ def _unclamp_nvidia_s3_power_state(applied: list[str], errors: list[str]) -> Non
     if not is_clamped:
         return
 
-    if not _UNCLAMP_KO.is_file() and (_UNCLAMP_KO.parent / "Makefile").is_file():
-        run_cmd_safe(["make", "-C", str(_UNCLAMP_KO.parent)])
+    if not _ko_matches_running_kernel(_UNCLAMP_KO) and (_UNCLAMP_KO.parent / "Makefile").is_file():
+        run_cmd_safe(["make", "-C", str(_UNCLAMP_KO.parent), "clean", "all"])
 
     if not _UNCLAMP_KO.is_file():
         errors.append(
@@ -539,10 +663,8 @@ def apply_workload_profile(
     if drm_poll.exists() or dry_run:
         _write_sysfs(drm_poll, "N", applied, errors, dry_run)
 
-    # 2. ACPI platform_profile
-    acpi_prof = sys_root / "firmware" / "acpi" / "platform_profile"
-    if acpi_prof.exists() or dry_run:
-        _write_sysfs(acpi_prof, spec.platform_profile, applied, errors, dry_run)
+    # 2. AWCC Platform Profile & Fan Boost (sequenced safely via class interface)
+    _apply_platform_profile_and_fans(spec, sys_root, applied, errors, dry_run)
 
     # 3. CPU Energy Performance Preference (EPP) & Max Turbo Frequency across all cores
     cpu_root = sys_root / "devices" / "system" / "cpu"
@@ -600,38 +722,23 @@ def apply_workload_profile(
             dry_run,
         )
 
-    # 6. Alienware WMI Fan Boost (hwmon5)
-    aw_hwmon = find_hwmon_by_name("alienware_wmi", sys_root / "class" / "hwmon")
-    if aw_hwmon is not None:
-        write_fan_boost(
-            aw_hwmon / "fan1_boost",
-            spec.cpu_fan_boost,
-            spec.platform_profile,
-            applied,
-            errors,
-            dry_run,
-        )
-        write_fan_boost(
-            aw_hwmon / "fan2_boost",
-            spec.gpu_fan_boost,
-            spec.platform_profile,
-            applied,
-            errors,
-            dry_run,
-        )
-
-    # 7. Unbind unplugged Killer E2500 (alx) in gaming-prime to prevent PCIe MMIO stats stalls
+    # 6. Unbind unplugged Killer E2500 (alx) in gaming-prime to prevent PCIe MMIO stats stalls
     _manage_alx_nic(spec, sys_root, applied, errors, dry_run)
 
-    # 8. Clear post-S3-resume NVIDIA 30W / 810MHz VRAM battery clamp if active
-    if not dry_run and spec.name in {
-        WorkloadProfileName.EXTREME_PERFORMANCE,
-        WorkloadProfileName.GAMING_PRIME,
-        WorkloadProfileName.OLLAMA_HEAVY,
-    }:
+    # 7. Clear post-S3-resume / custom-profile NVIDIA 30W / 810MHz VRAM clamp if active
+    if (
+        not dry_run
+        and sys_root == Path("/sys")
+        and spec.name
+        in {
+            WorkloadProfileName.EXTREME_PERFORMANCE,
+            WorkloadProfileName.GAMING_PRIME,
+            WorkloadProfileName.OLLAMA_HEAVY,
+        }
+    ):
         _unclamp_nvidia_s3_power_state(applied, errors)
 
-    # 9. Apply NVIDIA GPU V/F undervolt offset & boost clock ceiling (-lgc) or reset (-rgc)
+    # 8. Apply NVIDIA GPU V/F undervolt offset & boost clock ceiling (-lgc) or reset (-rgc)
     _apply_nvml_vf_offset(spec.gpu_vf_offset_mhz, applied, errors, dry_run, sys_root)
     if dry_run:
         if spec.gpu_max_clock_mhz is not None:
@@ -653,6 +760,23 @@ def apply_workload_profile(
             if rc == 0:
                 applied.append("nvidia-smi -rgc (GPU boost clock range unlocked)")
 
+    # 9. Verify live gaming-prime core configuration invariants post-apply
+    if spec.name == WorkloadProfileName.GAMING_PRIME and not dry_run and sys_root == Path("/sys"):
+        inv_ok, inv_violations = verify_gaming_prime_invariants(
+            sys_root=sys_root, proc_root=proc_root
+        )
+        if inv_ok:
+            applied.append(
+                "gaming-prime core invariants verified: "
+                f"profile={GAMING_PRIME_PLATFORM_PROFILE}, "
+                f"fan_boost=+{GAMING_PRIME_FAN_BOOST_PCT}%/+{GAMING_PRIME_FAN_BOOST_PCT}%, "
+                f"RAPL={GAMING_PRIME_PL1_W}W/{GAMING_PRIME_PL2_W}W, "
+                f"GPU=+{GAMING_PRIME_GPU_VF_OFFSET_MHZ}MHz @ <={GAMING_PRIME_GPU_MAX_CLOCK_MHZ}MHz"
+            )
+        else:
+            for violation in inv_violations:
+                errors.append(f"gaming-prime invariant violation: {violation}")
+
     # 10. Persist startup profile on boot if requested, or record session profile for S3 resume
     if persist_startup:
         s_applied, s_errors = configure_startup_profile(
@@ -669,3 +793,60 @@ def apply_workload_profile(
         _record_session_profile(spec, run_dir, etc_dir, sleep_dir, applied, errors)
 
     return tuple(applied), tuple(errors)
+
+
+def verify_gaming_prime_invariants(
+    sys_root: Path = Path("/sys"),
+    proc_root: Path = Path("/proc"),
+) -> tuple[bool, tuple[str, ...]]:
+    """Verify all core configuration invariants of gaming-prime against live hardware state."""
+    violations: list[str] = []
+    tp = collect_thermal_power(sys_root=sys_root, klog="")
+
+    if tp.platform_profile != GAMING_PRIME_PLATFORM_PROFILE:
+        violations.append(
+            f"platform_profile={tp.platform_profile!r} (expected {GAMING_PRIME_PLATFORM_PROFILE!r})"
+        )
+    if tp.cpu_fan_boost != GAMING_PRIME_FAN_BOOST_PCT:
+        violations.append(
+            f"cpu_fan_boost={tp.cpu_fan_boost} (expected {GAMING_PRIME_FAN_BOOST_PCT})"
+        )
+    if tp.gpu_fan_boost != GAMING_PRIME_FAN_BOOST_PCT:
+        violations.append(
+            f"gpu_fan_boost={tp.gpu_fan_boost} (expected {GAMING_PRIME_FAN_BOOST_PCT})"
+        )
+    if tp.msr_pl1_w is None or abs(tp.msr_pl1_w - GAMING_PRIME_PL1_W) > 0.5:
+        violations.append(f"msr_pl1_w={tp.msr_pl1_w}W (expected {GAMING_PRIME_PL1_W}W)")
+    if tp.msr_pl2_w is None or abs(tp.msr_pl2_w - GAMING_PRIME_PL2_W) > 0.5:
+        violations.append(f"msr_pl2_w={tp.msr_pl2_w}W (expected {GAMING_PRIME_PL2_W}W)")
+    if tp.mmio_pl1_w is None or abs(tp.mmio_pl1_w - GAMING_PRIME_PL1_W) > 0.5:
+        violations.append(f"mmio_pl1_w={tp.mmio_pl1_w}W (expected {GAMING_PRIME_PL1_W}W)")
+    if tp.mmio_pl2_w is None or abs(tp.mmio_pl2_w - GAMING_PRIME_PL2_W) > 0.5:
+        violations.append(f"mmio_pl2_w={tp.mmio_pl2_w}W (expected {GAMING_PRIME_PL2_W}W)")
+
+    max_freq = read_int_safe(
+        sys_root / "devices" / "system" / "cpu" / "cpu0" / "cpufreq" / "scaling_max_freq"
+    )
+    if max_freq is not None and max_freq != GAMING_PRIME_CPU_MAX_FREQ_KHZ:
+        violations.append(
+            f"cpu0 scaling_max_freq={max_freq} (expected {GAMING_PRIME_CPU_MAX_FREQ_KHZ})"
+        )
+
+    alx_bound = sorted((sys_root / "bus" / "pci" / "drivers" / "alx").glob("0000:*"))
+    for dev_dir in alx_bound:
+        net_dir = dev_dir / "net"
+        ifaces = sorted(net_dir.glob("*")) if net_dir.is_dir() else []
+        if not any(read_int_safe(iface / "carrier") == 1 for iface in ifaces):
+            violations.append(f"unplugged alx NIC {dev_dir.name} still bound")
+
+    if sys_root == Path("/sys"):
+        gpu = collect_gpu_display(sys_root=sys_root, proc_root=proc_root, klog="")
+        if gpu.gpu_vf_offset_mhz != GAMING_PRIME_GPU_VF_OFFSET_MHZ:
+            violations.append(
+                f"gpu_vf_offset_mhz={gpu.gpu_vf_offset_mhz} "
+                f"(expected +{GAMING_PRIME_GPU_VF_OFFSET_MHZ} MHz)"
+            )
+        if gpu.gpu_power_cap_w is not None and gpu.gpu_power_cap_w < 60.0:
+            violations.append(f"gpu_power_cap_w={gpu.gpu_power_cap_w}W (clamped below 90W)")
+
+    return len(violations) == 0, tuple(violations)

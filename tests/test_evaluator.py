@@ -6,12 +6,22 @@ import errno
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from aw_m17_diag.engine.evaluator import evaluate_preflight, evaluate_snapshots
 from aw_m17_diag.engine.profiles import (
+    GAMING_PRIME_CPU_MAX_FREQ_KHZ,
+    GAMING_PRIME_FAN_BOOST_PCT,
+    GAMING_PRIME_GPU_MAX_CLOCK_MHZ,
+    GAMING_PRIME_GPU_VF_OFFSET_MHZ,
+    GAMING_PRIME_PL1_W,
+    GAMING_PRIME_PL2_W,
+    GAMING_PRIME_PLATFORM_PROFILE,
     apply_workload_profile,
     configure_startup_profile,
     get_startup_profile_status,
     get_workload_profile,
+    verify_gaming_prime_invariants,
     write_fan_boost,
 )
 from aw_m17_diag.models import (
@@ -19,6 +29,7 @@ from aw_m17_diag.models import (
     Severity,
     SystemAuditReport,
     WorkloadProfileName,
+    WorkloadProfileSpec,
 )
 from tests.test_driver_advisor import make_sample_snapshots
 
@@ -185,7 +196,7 @@ def test_write_fan_boost_handles_ebadrqc_under_preset_profile(tmp_path: Path) ->
 
 
 def test_gaming_prime_unbinds_unplugged_alx_and_preserves_active_carrier(tmp_path: Path) -> None:
-    """Verify gaming-prime unbinds alx when carrier=0 and keeps it bound when carrier=1."""
+    """Verify gaming-prime enforces all core config invariants and carrier-aware alx unbind."""
     sys_root = tmp_path / "sys"
     proc_root = tmp_path / "proc"
     alx_drv = sys_root / "bus" / "pci" / "drivers" / "alx"
@@ -193,7 +204,18 @@ def test_gaming_prime_unbinds_unplugged_alx_and_preserves_active_carrier(tmp_pat
     iface_dir.mkdir(parents=True)
     (sys_root / "bus" / "pci" / "devices" / "0000:6f:00.0").mkdir(parents=True)
 
-    # Case 1: carrier = 0 (unplugged) -> unbind
+    pprof_dir = sys_root / "class" / "platform-profile" / "platform-profile-0"
+    pprof_dir.mkdir(parents=True)
+    (pprof_dir / "name").write_text("alienware-wmi\n", encoding="utf-8")
+    (pprof_dir / "profile").write_text("balanced-performance\n", encoding="utf-8")
+
+    aw_hwmon = sys_root / "class" / "hwmon" / "hwmon5"
+    aw_hwmon.mkdir(parents=True)
+    (aw_hwmon / "name").write_text("alienware_wmi\n", encoding="utf-8")
+    (aw_hwmon / "fan1_boost").write_text("0\n", encoding="utf-8")
+    (aw_hwmon / "fan2_boost").write_text("0\n", encoding="utf-8")
+
+    # Case 1: carrier = 0 (unplugged) -> unbind + custom +100% fan boost + 38W/60W + +165MHz@1560MHz
     (iface_dir / "carrier").write_text("0\n", encoding="utf-8")
     spec = get_workload_profile(WorkloadProfileName.GAMING_PRIME)
     applied, errors = apply_workload_profile(
@@ -203,11 +225,26 @@ def test_gaming_prime_unbinds_unplugged_alx_and_preserves_active_carrier(tmp_pat
         proc_root=proc_root,
     )
     assert not errors
+    assert any(
+        f"platform-profile-0/profile <- {GAMING_PRIME_PLATFORM_PROFILE}" in item
+        for item in applied
+    )
+    assert any(f"fan1_boost <- {GAMING_PRIME_FAN_BOOST_PCT}" in item for item in applied)
+    assert any(f"fan2_boost <- {GAMING_PRIME_FAN_BOOST_PCT}" in item for item in applied)
     assert any("drivers/alx/unbind <- 0000:6f:00.0" in item for item in applied)
-    assert any("constraint_0_power_limit_uw <- 45000000" in item for item in applied)
-    assert any("constraint_1_power_limit_uw <- 65000000" in item for item in applied)
-    assert any("NVML GPC V/F offset <- +135 MHz" in item for item in applied)
-    assert any("nvidia-smi -lgc 300,1590" in item for item in applied)
+    assert any(
+        f"constraint_0_power_limit_uw <- {GAMING_PRIME_PL1_W * 1_000_000}" in item
+        for item in applied
+    )
+    assert any(
+        f"constraint_1_power_limit_uw <- {GAMING_PRIME_PL2_W * 1_000_000}" in item
+        for item in applied
+    )
+    assert any(
+        f"NVML GPC V/F offset <- +{GAMING_PRIME_GPU_VF_OFFSET_MHZ} MHz" in item
+        for item in applied
+    )
+    assert any(f"nvidia-smi -lgc 300,{GAMING_PRIME_GPU_MAX_CLOCK_MHZ}" in item for item in applied)
 
     # Case 2: carrier = 1 (wired Ethernet connected) -> keep bound
     (iface_dir / "carrier").write_text("1\n", encoding="utf-8")
@@ -318,6 +355,127 @@ def test_extreme_performance_profile_applies_performance_epp_and_70w_rapl(
     assert any("energy_performance_preference <- performance" in item for item in applied)
     assert any("constraint_0_power_limit_uw <- 70000000" in item for item in applied)
     assert any("constraint_1_power_limit_uw <- 90000000" in item for item in applied)
+
+
+def test_leaving_custom_profile_zeroes_fan_boost_first(tmp_path: Path) -> None:
+    """Verify leaving 'custom' resets fan1_boost/fan2_boost to 0 before switching preset."""
+    sys_root = tmp_path / "sys"
+    proc_root = tmp_path / "proc"
+
+    pprof_dir = sys_root / "class" / "platform-profile" / "platform-profile-0"
+    pprof_dir.mkdir(parents=True)
+    (pprof_dir / "name").write_text("alienware-wmi\n", encoding="utf-8")
+    (pprof_dir / "profile").write_text("custom\n", encoding="utf-8")
+
+    aw_hwmon = sys_root / "class" / "hwmon" / "hwmon5"
+    aw_hwmon.mkdir(parents=True)
+    (aw_hwmon / "name").write_text("alienware_wmi\n", encoding="utf-8")
+    (aw_hwmon / "fan1_boost").write_text("100\n", encoding="utf-8")
+    (aw_hwmon / "fan2_boost").write_text("100\n", encoding="utf-8")
+
+    daily = get_workload_profile(WorkloadProfileName.BALANCED_DAILY)
+    applied, errors = apply_workload_profile(
+        spec=daily,
+        dry_run=True,
+        sys_root=sys_root,
+        proc_root=proc_root,
+    )
+    assert not errors
+    fan1_idx = next(i for i, s in enumerate(applied) if "fan1_boost <- 0" in s)
+    fan2_idx = next(i for i, s in enumerate(applied) if "fan2_boost <- 0" in s)
+    prof_idx = next(i for i, s in enumerate(applied) if "platform-profile-0/profile <- balanced" in s)
+    assert fan1_idx < prof_idx
+    assert fan2_idx < prof_idx
+
+
+def test_workload_profile_spec_enforces_domain_invariants() -> None:
+    """Verify WorkloadProfileSpec rejects out-of-range AWCC fan boost or unsafe V/F offsets."""
+    with pytest.raises(ValueError, match=r"0\.\.100%"):
+        WorkloadProfileSpec(
+            name=WorkloadProfileName.GAMING_PRIME,
+            description="bad fan boost",
+            platform_profile="custom",
+            epp="balance_performance",
+            msr_pl1_w=38,
+            msr_pl2_w=60,
+            mmio_pl1_w=38,
+            mmio_pl2_w=60,
+            swappiness=10,
+            dirty_ratio=10,
+            dirty_background_ratio=5,
+            cpu_fan_boost=200,
+            gpu_fan_boost=200,
+            gpu_max_clock_mhz=1560,
+            gpu_vf_offset_mhz=165,
+        )
+
+    with pytest.raises(ValueError, match="gpu_max_clock_mhz"):
+        WorkloadProfileSpec(
+            name=WorkloadProfileName.GAMING_PRIME,
+            description="missing ceiling",
+            platform_profile="custom",
+            epp="balance_performance",
+            msr_pl1_w=38,
+            msr_pl2_w=60,
+            mmio_pl1_w=38,
+            mmio_pl2_w=60,
+            swappiness=10,
+            dirty_ratio=10,
+            dirty_background_ratio=5,
+            cpu_fan_boost=100,
+            gpu_fan_boost=100,
+            gpu_max_clock_mhz=None,
+            gpu_vf_offset_mhz=165,
+        )
+
+
+def test_verify_gaming_prime_invariants_detects_drift(tmp_path: Path) -> None:
+    """Verify verify_gaming_prime_invariants validates all sysfs invariants and catches drift."""
+    sys_root = tmp_path / "sys"
+    proc_root = tmp_path / "proc"
+
+    acpi_dir = sys_root / "firmware" / "acpi"
+    acpi_dir.mkdir(parents=True)
+    (acpi_dir / "platform_profile").write_text("custom\n", encoding="utf-8")
+
+    aw_hwmon = sys_root / "class" / "hwmon" / "hwmon5"
+    aw_hwmon.mkdir(parents=True)
+    (aw_hwmon / "name").write_text("alienware_wmi\n", encoding="utf-8")
+    (aw_hwmon / "fan1_boost").write_text(f"{GAMING_PRIME_FAN_BOOST_PCT}\n", encoding="utf-8")
+    (aw_hwmon / "fan2_boost").write_text(f"{GAMING_PRIME_FAN_BOOST_PCT}\n", encoding="utf-8")
+
+    for dom in ("intel-rapl:0", "intel-rapl-mmio:0"):
+        rdir = sys_root / "class" / "powercap" / dom
+        rdir.mkdir(parents=True)
+        (rdir / "constraint_0_power_limit_uw").write_text(
+            f"{GAMING_PRIME_PL1_W * 1_000_000}\n", encoding="utf-8"
+        )
+        (rdir / "constraint_1_power_limit_uw").write_text(
+            f"{GAMING_PRIME_PL2_W * 1_000_000}\n", encoding="utf-8"
+        )
+
+    cpu0 = sys_root / "devices" / "system" / "cpu" / "cpu0" / "cpufreq"
+    cpu0.mkdir(parents=True)
+    (cpu0 / "scaling_max_freq").write_text(
+        f"{GAMING_PRIME_CPU_MAX_FREQ_KHZ}\n", encoding="utf-8"
+    )
+
+    ok, violations = verify_gaming_prime_invariants(sys_root=sys_root, proc_root=proc_root)
+    assert ok
+    assert violations == ()
+
+    # Introduce drift in PL1 and fan2_boost
+    (aw_hwmon / "fan2_boost").write_text("0\n", encoding="utf-8")
+    (sys_root / "class" / "powercap" / "intel-rapl:0" / "constraint_0_power_limit_uw").write_text(
+        "65000000\n", encoding="utf-8"
+    )
+    ok_drift, drift_violations = verify_gaming_prime_invariants(
+        sys_root=sys_root, proc_root=proc_root
+    )
+    assert not ok_drift
+    assert any("gpu_fan_boost=0" in v for v in drift_violations)
+    assert any("msr_pl1_w=65.0W" in v for v in drift_violations)
+
 
 
 

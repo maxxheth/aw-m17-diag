@@ -78,10 +78,15 @@ def render_audit_report(report: SystemAuditReport) -> None:
     )
 
     gpu = report.gpu_display
-    clk_str = (
-        f" | Clocks: Core={gpu.gpu_clock_graphics_mhz}MHz, VRAM={gpu.gpu_clock_mem_mhz}MHz"
-        if gpu.gpu_clock_graphics_mhz is not None
+    vf_str = (
+        f" | UV {gpu.gpu_vf_offset_mhz:+d}MHz"
+        if gpu.gpu_vf_offset_mhz is not None and gpu.gpu_vf_offset_mhz != 0
         else ""
+    )
+    clk_str = (
+        f" | Clocks: Core={gpu.gpu_clock_graphics_mhz}MHz, VRAM={gpu.gpu_clock_mem_mhz}MHz{vf_str}"
+        if gpu.gpu_clock_graphics_mhz is not None
+        else vf_str
     )
     therm_clamp_str = (
         " [bold red](SW Thermal Slowdown ACTIVE!)[/bold red]" if gpu.gpu_sw_thermal_slowdown else ""
@@ -321,12 +326,12 @@ def render_profiles_table(
             border_style="cyan",
         )
     )
-    table = Table(show_lines=True)
-    table.add_column("Profile Name", style="bold cyan", width=20)
-    table.add_column("ACPI / EPP", width=24)
-    table.add_column("CPU RAPL (PL1/PL2)", width=18)
-    table.add_column("Fan Boost", width=14)
-    table.add_column("Description", width=44)
+    table = Table(show_lines=True, expand=True)
+    table.add_column("Profile Name", style="bold cyan", ratio=18)
+    table.add_column("ACPI / EPP", ratio=18)
+    table.add_column("RAPL & GPU V/F", ratio=18)
+    table.add_column("Fan Boost", ratio=12)
+    table.add_column("Description", ratio=34)
 
     for spec in PROFILES.values():
         badges: list[str] = []
@@ -338,10 +343,19 @@ def render_profiles_table(
         name_cell = spec.name.value
         if badges:
             name_cell += "\n" + " ".join(badges)
+        gpu_cell = (
+            f"UV +{spec.gpu_vf_offset_mhz}MHz\n<={spec.gpu_max_clock_mhz}MHz"
+            if spec.gpu_vf_offset_mhz > 0 and spec.gpu_max_clock_mhz is not None
+            else (
+                f"<={spec.gpu_max_clock_mhz}MHz"
+                if spec.gpu_max_clock_mhz is not None
+                else "GPU: Unlocked"
+            )
+        )
         table.add_row(
             name_cell,
             f"ACPI: {spec.platform_profile}\nEPP:  {spec.epp}",
-            f"PL1: {spec.msr_pl1_w}W\nPL2: {spec.msr_pl2_w}W",
+            f"PL1/2: {spec.msr_pl1_w}/{spec.msr_pl2_w}W\n{gpu_cell}",
             f"CPU: +{spec.cpu_fan_boost}%\nGPU: +{spec.gpu_fan_boost}%",
             spec.description,
         )
