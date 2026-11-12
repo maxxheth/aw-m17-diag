@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import re
 from pathlib import Path
 
@@ -76,6 +77,29 @@ def _query_nvidia_smi() -> tuple[
         clock_mem,
         sw_therm_slowdown,
     )
+
+
+def _query_nvml_vf_offset() -> int | None:
+    """Query current NVML GPC V/F clock offset (MHz) via libnvidia-ml.so.1."""
+    try:
+        nvml = ctypes.CDLL("libnvidia-ml.so.1")
+        if nvml.nvmlInit_v2() != 0:
+            return None
+        try:
+            handle = ctypes.c_void_p()
+            if nvml.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(handle)) != 0:
+                return None
+            fn = getattr(nvml, "nvmlDeviceGetGpcClkVfOffset", None)
+            if fn is None:
+                return None
+            offset = ctypes.c_int()
+            if fn(handle, ctypes.byref(offset)) != 0:
+                return None
+            return int(offset.value)
+        finally:
+            nvml.nvmlShutdown()
+    except OSError:
+        return None
 
 
 def _get_flatpak_nvidia_gl_versions() -> tuple[str, ...]:
@@ -170,4 +194,5 @@ def collect_gpu_display(
         gpu_clock_graphics_mhz=clock_gr,
         gpu_clock_mem_mhz=clock_mem,
         gpu_sw_thermal_slowdown=sw_therm_slowdown,
+        gpu_vf_offset_mhz=_query_nvml_vf_offset() if sys_root == Path("/sys") else None,
     )

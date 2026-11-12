@@ -58,16 +58,21 @@ def _build_dashboard_view(report: SystemAuditReport) -> Group:
 
     gpu = report.gpu_display
     cap_color = "red" if (gpu.gpu_power_cap_w or 90.0) < 60.0 else "green"
-    slowdown_str = (
-        "[bold red]ACTIVE (30W/P5 Clamp!)[/bold red]"
-        if gpu.gpu_sw_thermal_slowdown
-        else "[green]None[/green]"
-    )
+    if gpu.gpu_sw_thermal_slowdown:
+        if (gpu.gpu_power_cap_w or 90.0) < 60.0:
+            slowdown_str = "[bold red]ACTIVE (30W/P5 S3 Clamp!)[/bold red]"
+        else:
+            slowdown_str = "[bold yellow]ACTIVE (87°C Target Throttle)[/bold yellow]"
+    else:
+        slowdown_str = "[green]None[/green]"
+    vf_str = ""
+    if gpu.gpu_vf_offset_mhz is not None and gpu.gpu_vf_offset_mhz != 0:
+        vf_str = f" | UV {gpu.gpu_vf_offset_mhz:+d}MHz"
     grid.add_row(
         "RTX 2070 Max-Q + i915",
         f"GPU Temp: [bold]{gpu.gpu_temp_c}°C[/bold] | Power: {gpu.gpu_power_w}W / [{cap_color}]{gpu.gpu_power_cap_w}W[/{cap_color}]\n"
         f"VRAM: {gpu.gpu_vram_used_mib} / {gpu.gpu_vram_total_mib} MiB ({gpu.gpu_pstate} | "
-        f"Core {gpu.gpu_clock_graphics_mhz}MHz / Mem {gpu.gpu_clock_mem_mhz}MHz)",
+        f"Core {gpu.gpu_clock_graphics_mhz}MHz / Mem {gpu.gpu_clock_mem_mhz}MHz{vf_str})",
         f"SW Thermal Slowdown: {slowdown_str}\n"
         f"DRM KMS Poll Disabled: {gpu.drm_kms_poll_disabled} | Flatpak Mismatch: {gpu.flatpak_driver_mismatch}",
     )

@@ -118,6 +118,7 @@ class GpuDisplaySnapshot:
     gpu_clock_graphics_mhz: int | None = None
     gpu_clock_mem_mhz: int | None = None
     gpu_sw_thermal_slowdown: bool = False
+    gpu_vf_offset_mhz: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +200,7 @@ class WorkloadProfileSpec:
     gpu_fan_boost: int
     cpu_max_freq_khz: int = 4_500_000
     gpu_max_clock_mhz: int | None = None
+    gpu_vf_offset_mhz: int = 0
     quiesce_unplugged_alx: bool = False
 
 

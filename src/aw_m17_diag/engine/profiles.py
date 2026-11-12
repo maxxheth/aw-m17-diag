@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import errno
 import os
 from pathlib import Path
@@ -68,25 +69,24 @@ PROFILES: dict[WorkloadProfileName, WorkloadProfileSpec] = {
     WorkloadProfileName.GAMING_PRIME: WorkloadProfileSpec(
         name=WorkloadProfileName.GAMING_PRIME,
         description=(
-            "Optimized for RTX 2070 Max-Q 90W gaming & Steam PRIME offload. "
-            "Balances shared CPU/GPU heatpipe with 55W/75W CPU RAPL & balance_performance EPP, "
-            "unlocks full 4.50GHz CPU & 90W GPU boost clocks for <16.6ms 60Hz PRIME vblank "
-            "pacing, unbinds unplugged alx NIC to prevent PCIe MMIO stats stalls, "
-            "and clears post-S3-resume 30W / 810MHz NVIDIA clamp."
+            "Cool & sustained 60Hz PRIME gaming with native NVML GPU undervolt (+135MHz V/F "
+            "offset @ 1590MHz ceiling) and 45W/65W shared-heatpipe RAPL relief (4.50GHz "
+            "single-core boost preserved). Unbinds unplugged alx NIC and clears S3 30W clamp."
         ),
         platform_profile="balanced-performance",
         epp="balance_performance",
-        msr_pl1_w=55,
-        msr_pl2_w=75,
-        mmio_pl1_w=55,
-        mmio_pl2_w=75,
+        msr_pl1_w=45,
+        msr_pl2_w=65,
+        mmio_pl1_w=45,
+        mmio_pl2_w=65,
         swappiness=10,
         dirty_ratio=10,
         dirty_background_ratio=5,
         cpu_fan_boost=35,
         gpu_fan_boost=35,
         cpu_max_freq_khz=4_500_000,
-        gpu_max_clock_mhz=None,
+        gpu_max_clock_mhz=1590,
+        gpu_vf_offset_mhz=135,
         quiesce_unplugged_alx=True,
     ),
     WorkloadProfileName.BALANCED_DAILY: WorkloadProfileSpec(
@@ -185,6 +185,59 @@ def write_fan_boost(
             )
         else:
             errors.append(f"{path}: {exc}")
+
+
+def _apply_nvml_vf_offset(
+    offset_mhz: int,
+    applied: list[str],
+    errors: list[str],
+    dry_run: bool,
+    sys_root: Path,
+) -> None:
+    """Apply or reset NVIDIA GPC V/F clock offset (undervolt when > 0 with -lgc) via NVML."""
+    sign_str = f"{offset_mhz:+d}" if offset_mhz != 0 else "0"
+    if dry_run:
+        applied.append(f"[DRY-RUN] NVML GPC V/F offset <- {sign_str} MHz")
+        return
+    if sys_root != Path("/sys"):
+        return
+
+    try:
+        nvml = ctypes.CDLL("libnvidia-ml.so.1")
+    except OSError as exc:
+        if offset_mhz != 0:
+            errors.append(f"libnvidia-ml.so.1 unavailable for GPU V/F offset: {exc}")
+        return
+
+    rc = nvml.nvmlInit_v2()
+    if rc != 0:
+        if offset_mhz != 0:
+            errors.append(f"nvmlInit_v2 failed (rc={rc})")
+        return
+
+    try:
+        handle = ctypes.c_void_p()
+        rc = nvml.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(handle))
+        if rc != 0:
+            if offset_mhz != 0:
+                errors.append(f"nvmlDeviceGetHandleByIndex_v2 failed (rc={rc})")
+            return
+
+        set_fn = getattr(nvml, "nvmlDeviceSetGpcClkVfOffset", None)
+        if set_fn is None:
+            if offset_mhz != 0:
+                errors.append("nvmlDeviceSetGpcClkVfOffset symbol missing in libnvidia-ml.so.1")
+            return
+
+        rc = set_fn(handle, ctypes.c_int(offset_mhz))
+        if rc != 0:
+            errors.append(f"nvmlDeviceSetGpcClkVfOffset({offset_mhz}) failed (rc={rc})")
+            return
+
+        note = "GPU V/F undervolt active" if offset_mhz > 0 else "stock V/F curve"
+        applied.append(f"NVML GPC V/F offset <- {sign_str} MHz ({note})")
+    finally:
+        nvml.nvmlShutdown()
 
 
 def _unclamp_nvidia_s3_power_state(applied: list[str], errors: list[str]) -> None:
@@ -578,8 +631,14 @@ def apply_workload_profile(
     }:
         _unclamp_nvidia_s3_power_state(applied, errors)
 
-    # 9. Apply NVIDIA GPU boost clock sweet-spot ceiling (-lgc) or reset (-rgc)
-    if not dry_run and sys_root == Path("/sys"):
+    # 9. Apply NVIDIA GPU V/F undervolt offset & boost clock ceiling (-lgc) or reset (-rgc)
+    _apply_nvml_vf_offset(spec.gpu_vf_offset_mhz, applied, errors, dry_run, sys_root)
+    if dry_run:
+        if spec.gpu_max_clock_mhz is not None:
+            applied.append(f"[DRY-RUN] nvidia-smi -lgc 300,{spec.gpu_max_clock_mhz}")
+        else:
+            applied.append("[DRY-RUN] nvidia-smi -rgc")
+    elif sys_root == Path("/sys"):
         run_cmd_safe(["nvidia-smi", "-pm", "1"])
         if spec.gpu_max_clock_mhz is not None:
             rc, out = run_cmd_safe(["nvidia-smi", "-lgc", f"300,{spec.gpu_max_clock_mhz}"])

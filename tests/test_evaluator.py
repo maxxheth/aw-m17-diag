@@ -204,6 +204,10 @@ def test_gaming_prime_unbinds_unplugged_alx_and_preserves_active_carrier(tmp_pat
     )
     assert not errors
     assert any("drivers/alx/unbind <- 0000:6f:00.0" in item for item in applied)
+    assert any("constraint_0_power_limit_uw <- 45000000" in item for item in applied)
+    assert any("constraint_1_power_limit_uw <- 65000000" in item for item in applied)
+    assert any("NVML GPC V/F offset <- +135 MHz" in item for item in applied)
+    assert any("nvidia-smi -lgc 300,1590" in item for item in applied)
 
     # Case 2: carrier = 1 (wired Ethernet connected) -> keep bound
     (iface_dir / "carrier").write_text("1\n", encoding="utf-8")

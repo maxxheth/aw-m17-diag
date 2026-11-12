@@ -11,7 +11,7 @@ Technical documentation and CLI reference for the Alienware m17 R1 (`0DG9D5`, BI
 | Profile Name | ACPI `platform_profile` | CPU `EPP` | CPU RAPL (`PL1` / `PL2`) | CPU Max Clock | GPU Boost Clock | Unplugged `alx` NIC | Primary Use Case |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **`extreme-performance`** | `balanced-performance` | `performance` (`0x00`) | `70W` / `90W` | `4.50 GHz` | Unlocked (`90W` `P0`) | Auto-unbound | Maximum zero-compromise all-core CPU turbo + 90W GPU performance; zero frequency ramp latency. |
-| **`gaming-prime`** | `balanced-performance` | `balance_performance` (`0x80`) | `55W` / `75W` | `4.50 GHz` | Unlocked (`90W` `P0`) | Auto-unbound | Cool & sustained 60Hz PRIME gaming; relieves shared CPU+GPU heatpipe by ~6–10°C while preserving `<16.67ms` vblank pacing. |
+| **`gaming-prime`** | `balanced-performance` | `balance_performance` (`0x80`) | `45W` / `65W` | `4.50 GHz` | `1,590 MHz` (`+135 MHz` NVML UV) | Auto-unbound | Cool & sustained 60Hz PRIME gaming with native NVML GPU V/F undervolt; cuts ~15–25W of shared-heatpipe heat while preserving `<16.67ms` vblank pacing. |
 | **`ollama-heavy`** | `balanced-performance` | `balance_performance` (`0x80`) | `65W` / `85W` | `4.50 GHz` | Unlocked (`90W` `P0`) | Bound (hotplug ready) | Sustained multi-hour local LLM inference (`AVX2` + `CUDA`) with `swappiness=10` & `dirty_ratio=10`. |
 | **`balanced-daily`** | `balanced` | `balance_performance` (`0x80`) | `45W` / `70W` | `4.50 GHz` | Unlocked | Bound (hotplug ready) | Quiet daily workstation profile locked to Intel nominal `45W` TDP. |
 | **`powersave`** | `quiet` | `power` (`0xFF`) | `25W` / `35W` | `4.50 GHz` | Unlocked | Bound (hotplug ready) | Cool & quiet low-power operation (`25W` PL1 / `35W` PL2). |
