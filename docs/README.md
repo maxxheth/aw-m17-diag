@@ -26,8 +26,12 @@ uv run aw-m17-diag profile show
 # 2. Apply a profile for the CURRENT SESSION ONLY (does not overwrite boot startup default)
 #    Records session state in /run/aw-m17-diag/current-profile so S3 sleep/resume preserves it.
 sudo $(which uv) run aw-m17-diag profile set gaming-prime
+sudo $(which uv) run aw-m17-diag profile set gaming-prime --refresh-steam  # or -r: recycle stale Steam Flatpak GL/Vulkan mounts & reload audio
 sudo $(which uv) run aw-m17-diag profile set unreal-engine
 sudo $(which uv) run aw-m17-diag profile set extreme-performance
+
+# Standalone Steam Flatpak GL/Vulkan & PipeWire refresh (fixes "Non-DX12 Video Card" after background flatpak update):
+uv run aw-m17-diag refresh-steam
 
 # 3. Apply a profile immediately AND set it to load automatically on system startup
 sudo $(which uv) run aw-m17-diag profile set gaming-prime --startup

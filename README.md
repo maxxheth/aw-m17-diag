@@ -33,7 +33,11 @@ uv run aw-m17-diag driver-advisor --export-dkms
 # View or apply workload profiles (extreme-performance, unreal-engine, ollama-heavy, gaming-prime, balanced-daily, powersave)
 uv run aw-m17-diag profile show
 sudo $(which uv) run aw-m17-diag profile set gaming-prime
+sudo $(which uv) run aw-m17-diag profile set gaming-prime --refresh-steam  # also recycles stale Steam Flatpak GL mounts
 sudo $(which uv) run aw-m17-diag profile set unreal-engine
+
+# Recycle a stale Steam Flatpak sandbox (fixes "Non-DX12 Video Card" after background flatpak GL updates)
+uv run aw-m17-diag refresh-steam
 
 # Configure or inspect the profile loaded automatically on system startup
 uv run aw-m17-diag profile startup --status

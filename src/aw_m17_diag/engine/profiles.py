@@ -7,6 +7,8 @@ import errno
 import os
 import platform
 import pwd
+import subprocess
+import time
 from pathlib import Path
 
 from aw_m17_diag.collectors._utils import (
@@ -510,6 +512,103 @@ def _evict_ollama_vram_models(
             errors.append(f"ollama stop {model_name} failed: {stop_out.strip()}")
 
 
+def _resolve_desktop_user_runtime() -> tuple[int, str, Path] | None:
+    """Resolve the active desktop user's (uid, username, /run/user/<uid>) runtime directory."""
+    run_user_dir = Path("/run/user")
+    if not run_user_dir.is_dir():
+        return None
+
+    candidate_uids: list[int] = []
+    sudo_uid_env = os.environ.get("SUDO_UID", "").strip()
+    if sudo_uid_env.isdigit():
+        candidate_uids.append(int(sudo_uid_env))
+    cur_uid = os.getuid()
+    if cur_uid != 0 and cur_uid not in candidate_uids:
+        candidate_uids.append(cur_uid)
+
+    for uid_dir in sorted(run_user_dir.iterdir()):
+        if uid_dir.name.isdigit():
+            uid = int(uid_dir.name)
+            if uid != 0 and uid not in candidate_uids:
+                candidate_uids.append(uid)
+
+    for uid in candidate_uids:
+        user_dir = run_user_dir / str(uid)
+        if not ((user_dir / "pipewire-0").exists() or (user_dir / "bus").exists()):
+            continue
+        try:
+            user_name = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            continue
+        return uid, user_name, user_dir
+    return None
+
+
+def _run_as_desktop_user(
+    uid: int, user_name: str, user_dir: Path, cmd: list[str], extra_env: dict[str, str] | None = None
+) -> list[str]:
+    """Build a command list executed in the desktop user's XDG/DBus session."""
+    env_vars = [
+        f"XDG_RUNTIME_DIR={user_dir}",
+        f"DBUS_SESSION_BUS_ADDRESS=unix:path={user_dir}/bus",
+    ]
+    if extra_env:
+        env_vars.extend(f"{k}={v}" for k, v in extra_env.items())
+    wrapped = ["env", *env_vars, *cmd]
+    if os.geteuid() == 0 and uid != 0:
+        return ["runuser", "-u", user_name, "--", *wrapped]
+    return wrapped
+
+
+def _apply_pipewire_quantum_and_rt(
+    min_quantum: int,
+    proc_root: Path,
+    applied: list[str],
+    errors: list[str],
+) -> None:
+    """Apply live PipeWire clock.min-quantum and restore pw-data-loop SCHED_FIFO:88 when root."""
+    run_user_dir = Path("/run/user")
+    if run_user_dir.is_dir():
+        for user_dir in sorted(run_user_dir.iterdir()):
+            if not user_dir.name.isdigit() or not (user_dir / "pipewire-0").exists():
+                continue
+            uid = int(user_dir.name)
+            try:
+                user_name = pwd.getpwuid(uid).pw_name
+            except KeyError:
+                continue
+            cmd = _run_as_desktop_user(
+                uid,
+                user_name,
+                user_dir,
+                ["pw-metadata", "-n", "settings", "0", "clock.min-quantum", str(min_quantum)],
+            )
+            rc, out = run_cmd_safe(cmd)
+            if rc == 0:
+                applied.append(f"PipeWire ({user_name}) clock.min-quantum <- {min_quantum}")
+            else:
+                errors.append(f"pw-metadata ({user_name}) clock.min-quantum failed: {out.strip()}")
+
+    if os.geteuid() == 0 and proc_root.is_dir():
+        promoted_tids: list[str] = []
+        target_comms = {"pipewire", "pipewire-pulse", "wireplumber"}
+        for pid_dir in proc_root.glob("[0-9]*"):
+            if read_text_safe(pid_dir / "comm") not in target_comms:
+                continue
+            task_dir = pid_dir / "task"
+            if not task_dir.is_dir():
+                continue
+            for tid_dir in task_dir.iterdir():
+                if read_text_safe(tid_dir / "comm") == "pw-data-loop":
+                    rc, _ = run_cmd_safe(["chrt", "-f", "-p", "88", tid_dir.name])
+                    if rc == 0:
+                        promoted_tids.append(tid_dir.name)
+        if promoted_tids:
+            applied.append(
+                f"Restored SCHED_FIFO:88 on pw-data-loop TIDs {', '.join(promoted_tids)}"
+            )
+
+
 def _enforce_low_crackling_audio(
     spec: WorkloadProfileSpec,
     sys_root: Path,
@@ -541,56 +640,118 @@ def _enforce_low_crackling_audio(
     if sys_root != Path("/sys"):
         return
 
-    # Apply clock.min-quantum to active desktop user PipeWire sessions
-    run_user_dir = Path("/run/user")
-    if run_user_dir.is_dir():
-        for user_dir in sorted(run_user_dir.iterdir()):
-            if not user_dir.name.isdigit() or not (user_dir / "pipewire-0").exists():
-                continue
-            uid = int(user_dir.name)
-            try:
-                user_name = pwd.getpwuid(uid).pw_name
-            except KeyError:
-                continue
-            cmd = [
-                "env",
-                f"XDG_RUNTIME_DIR={user_dir}",
-                "pw-metadata",
-                "-n",
-                "settings",
-                "0",
-                "clock.min-quantum",
-                str(spec.min_pipewire_quantum),
-            ]
-            if os.geteuid() == 0 and uid != 0:
-                cmd = ["runuser", "-u", user_name, "--", *cmd]
-            rc, out = run_cmd_safe(cmd)
-            if rc == 0:
-                applied.append(
-                    f"PipeWire ({user_name}) clock.min-quantum <- {spec.min_pipewire_quantum}"
-                )
-            else:
-                errors.append(f"pw-metadata ({user_name}) clock.min-quantum failed: {out.strip()}")
+    _apply_pipewire_quantum_and_rt(spec.min_pipewire_quantum, proc_root, applied, errors)
 
-    # Restore SCHED_FIFO:88 on pw-data-loop threads demoted by rtkit-daemon on S3 resume
-    if proc_root.is_dir():
-        promoted_tids: list[str] = []
-        target_comms = {"pipewire", "pipewire-pulse", "wireplumber"}
-        for pid_dir in proc_root.glob("[0-9]*"):
-            if read_text_safe(pid_dir / "comm") not in target_comms:
-                continue
-            task_dir = pid_dir / "task"
-            if not task_dir.is_dir():
-                continue
-            for tid_dir in task_dir.iterdir():
-                if read_text_safe(tid_dir / "comm") == "pw-data-loop":
-                    rc, _ = run_cmd_safe(["chrt", "-f", "-p", "88", tid_dir.name])
-                    if rc == 0:
-                        promoted_tids.append(tid_dir.name)
-        if promoted_tids:
-            applied.append(
-                f"Restored SCHED_FIFO:88 on pw-data-loop TIDs {', '.join(promoted_tids)}"
+
+def refresh_steam_flatpak_sandbox(
+    relaunch: bool = True,
+    restart_audio: bool = True,
+    dry_run: bool = False,
+    proc_root: Path = Path("/proc"),
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Recycle the Steam Flatpak bwrap sandbox to pick up updated NVIDIA GL/Vulkan OSTree mounts."""
+    applied: list[str] = []
+    errors: list[str] = []
+
+    if dry_run:
+        applied.append("[DRY-RUN] flatpak kill com.valvesoftware.Steam")
+        if restart_audio:
+            applied.append("[DRY-RUN] Restart PipeWire/WirePlumber & enforce clock.min-quantum=512")
+        if relaunch:
+            applied.append("[DRY-RUN] Relaunch com.valvesoftware.Steam in fresh Flatpak mount namespace")
+        return tuple(applied), tuple(errors)
+
+    kill_rc, _ = run_cmd_safe(["flatpak", "kill", "com.valvesoftware.Steam"])
+    time.sleep(1.5)
+    if kill_rc == 0:
+        applied.append("Stopped stale com.valvesoftware.Steam Flatpak sandbox")
+    else:
+        applied.append("No active com.valvesoftware.Steam Flatpak sandbox needed stopping")
+
+    desktop = _resolve_desktop_user_runtime()
+    if restart_audio and desktop is not None:
+        uid, user_name, user_dir = desktop
+        restart_cmd = _run_as_desktop_user(
+            uid,
+            user_name,
+            user_dir,
+            ["systemctl", "--user", "restart", "wireplumber", "pipewire", "pipewire-pulse"],
+        )
+        rc_audio, out_audio = run_cmd_safe(restart_cmd)
+        if rc_audio == 0:
+            applied.append(f"Restarted user audio services ({user_name}: wireplumber/pipewire/pulse)")
+            time.sleep(1.5)
+            _apply_pipewire_quantum_and_rt(
+                GAMING_PRIME_MIN_PIPEWIRE_QUANTUM, proc_root, applied, errors
             )
+        else:
+            errors.append(f"systemctl --user restart audio failed: {out_audio.strip()}")
+
+    if relaunch:
+        launch_cmd = ["flatpak", "run", "com.valvesoftware.Steam"]
+        if desktop is not None:
+            uid, user_name, user_dir = desktop
+            home_dir = pwd.getpwuid(uid).pw_dir
+            display = os.environ.get("DISPLAY") or ":0"
+            xauth = os.environ.get("XAUTHORITY") or f"{home_dir}/.Xauthority"
+            launch_cmd = _run_as_desktop_user(
+                uid,
+                user_name,
+                user_dir,
+                launch_cmd,
+                extra_env={"DISPLAY": display, "XAUTHORITY": xauth},
+            )
+        try:
+            subprocess.Popen(
+                launch_cmd,
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            applied.append("Relaunched com.valvesoftware.Steam in fresh Flatpak mount namespace")
+        except OSError as exc:
+            errors.append(f"Failed to relaunch Steam: {exc}")
+            return tuple(applied), tuple(errors)
+
+        icd_live = False
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline:
+            if proc_root.is_dir():
+                for pid_dir in proc_root.glob("[0-9]*"):
+                    if read_text_safe(pid_dir / "comm") != "steam":
+                        continue
+                    icd_file = (
+                        pid_dir
+                        / "root"
+                        / "usr"
+                        / "lib"
+                        / "x86_64-linux-gnu"
+                        / "GL"
+                        / "vulkan"
+                        / "icd.d"
+                        / "nvidia_icd.json"
+                    )
+                    try:
+                        if icd_file.exists():
+                            icd_live = True
+                            break
+                    except OSError:
+                        continue
+            if icd_live:
+                break
+            time.sleep(0.5)
+
+        if icd_live:
+            applied.append(
+                "Verified fresh Steam Flatpak mount namespace: nvidia_icd.json is live (DX12/Vulkan ready)"
+            )
+        else:
+            applied.append(
+                "Steam Flatpak relaunch started (bwrap container still initializing Vulkan ICD mount)"
+            )
+
+    return tuple(applied), tuple(errors)
 
 
 def _manage_alx_nic(

@@ -293,8 +293,25 @@ def evaluate_snapshots(
             )
         )
 
-    # 7. Minefield 6: Flatpak vs Host NVIDIA Driver Synchronization
-    if gpu_display.flatpak_driver_mismatch:
+    # 7. Minefield 6: Flatpak vs Host NVIDIA Driver Synchronization & Stale Mount Detection
+    if gpu_display.flatpak_steam_mount_stale:
+        findings.append(
+            HealthFinding(
+                check_id="GPU-FLATPAK-02",
+                subsystem="GPU / Flatpak",
+                title="Stale Steam Flatpak NVIDIA Vulkan ICD Mount (Non-DX12 Video Card Risk)",
+                severity=Severity.CRITICAL,
+                current_value="nvidia_icd.json dangling inside running Steam bwrap namespace",
+                expected_value="Live NVIDIA Vulkan ICD mount",
+                explanation=(
+                    "A background Flatpak GL update replaced the host OSTree commit while Steam "
+                    "was still running, leaving nvidia_icd.json dangling inside Steam's sandbox."
+                ),
+                remediation_tier=RemediationTier.TIER_1_USERSPACE_SYSFS,
+                remediation_cmd="uv run aw-m17-diag refresh-steam",
+            )
+        )
+    elif gpu_display.flatpak_driver_mismatch:
         fp_list = ", ".join(gpu_display.flatpak_nvidia_gl_versions) or "none"
         findings.append(
             HealthFinding(
@@ -622,21 +639,29 @@ def evaluate_preflight(
                 remediation_cmd="ollama ps && sudo $(which uv) run aw-m17-diag profile set gaming-prime",
             )
         )
+        if report.gpu_display.flatpak_steam_mount_stale:
+            gl_sev = Severity.CRITICAL
+            gl_cur = "STALE MOUNT (nvidia_icd.json unlinked after flatpak update)"
+            gl_cmd = "uv run aw-m17-diag refresh-steam"
+        elif report.gpu_display.flatpak_driver_mismatch:
+            gl_sev = Severity.WARN
+            gl_cur = "MISMATCH"
+            gl_cmd = "flatpak update -y"
+        else:
+            gl_sev = Severity.PASS
+            gl_cur = "Synced"
+            gl_cmd = "flatpak update -y"
         checks.append(
             HealthFinding(
                 check_id="PRE-GAME-GL",
                 subsystem="Steam / Flatpak GL",
                 title="Host vs. Flatpak NVIDIA GL Driver Alignment",
-                severity=Severity.WARN
-                if report.gpu_display.flatpak_driver_mismatch
-                else Severity.PASS,
-                current_value=(
-                    "MISMATCH" if report.gpu_display.flatpak_driver_mismatch else "Synced"
-                ),
+                severity=gl_sev,
+                current_value=gl_cur,
                 expected_value=f"Synced with {report.gpu_display.nvidia_driver_version}",
-                explanation="Required for Steam Flatpak DRI3/GLX hardware acceleration.",
+                explanation="Required for Steam Flatpak DRI3/GLX/Vulkan DX12 initialization.",
                 remediation_tier=RemediationTier.TIER_1_USERSPACE_SYSFS,
-                remediation_cmd="flatpak update -y",
+                remediation_cmd=gl_cmd,
             )
         )
 

@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
+from aw_m17_diag.collectors.gpu_display import _is_steam_flatpak_gl_mount_stale
 from aw_m17_diag.engine.evaluator import evaluate_preflight, evaluate_snapshots
 from aw_m17_diag.engine.profiles import (
     GAMING_PRIME_CPU_MAX_FREQ_KHZ,
@@ -35,6 +36,7 @@ from aw_m17_diag.engine.profiles import (
     configure_startup_profile,
     get_startup_profile_status,
     get_workload_profile,
+    refresh_steam_flatpak_sandbox,
     verify_gaming_prime_invariants,
     verify_unreal_engine_invariants,
     write_fan_boost,
@@ -784,3 +786,80 @@ def test_evaluate_preflight_unreal_checks_vram_invariants_and_inotify() -> None:
     assert not ready_game_starved
     game_by_id = {c.check_id: c for c in game_starved_checks}
     assert game_by_id["PRE-GAME-VRAM"].severity == Severity.CRITICAL
+
+
+def test_stale_steam_flatpak_gl_mount_detection_and_refresh_dry_run(tmp_path: Path) -> None:
+    """Verify dangling nvidia_icd.json in Steam sandbox triggers CRITICAL & dry-run refresh works."""
+    from dataclasses import replace
+
+    proc_root = tmp_path / "proc"
+    steam_proc = proc_root / "1234"
+    icd_dir = (
+        steam_proc / "root" / "usr" / "lib" / "x86_64-linux-gnu" / "GL" / "vulkan" / "icd.d"
+    )
+    icd_dir.mkdir(parents=True)
+    (steam_proc / "comm").write_text("steam\n", encoding="utf-8")
+
+    target_icd = tmp_path / "live_nvidia_icd.json"
+    icd_link = icd_dir / "nvidia_icd.json"
+    icd_link.symlink_to(tmp_path / "pruned_nvidia_icd.json")
+
+    assert _is_steam_flatpak_gl_mount_stale(proc_root) is True
+
+    icd_link.unlink()
+    target_icd.write_text('{"ICD": {}}\n', encoding="utf-8")
+    icd_link.symlink_to(target_icd)
+    assert _is_steam_flatpak_gl_mount_stale(proc_root) is False
+
+    storage, pcie, gpu, tp = make_sample_snapshots()
+    mem = MemorySnapshot(
+        ram_total_gib=62.6,
+        ram_available_gib=48.0,
+        ram_used_percent=23.0,
+        swap_total_gib=32.0,
+        swap_free_gib=32.0,
+        swap_used_percent=0.0,
+        swappiness=10,
+        vfs_cache_pressure=50,
+        dirty_ratio=10,
+        dirty_background_ratio=5,
+        dirty_pages_mib=4.0,
+    )
+    stale_gpu = replace(
+        gpu,
+        gpu_vram_used_mib=700,
+        gpu_vram_total_mib=8192,
+        flatpak_driver_mismatch=False,
+        flatpak_steam_mount_stale=True,
+    )
+    findings = evaluate_snapshots(
+        storage=storage,
+        memory=mem,
+        pcie_iommu=pcie,
+        gpu_display=stale_gpu,
+        thermal_power=tp,
+    )
+    f_by_id = {f.check_id: f for f in findings}
+    assert f_by_id["GPU-FLATPAK-02"].severity == Severity.CRITICAL
+    assert f_by_id["GPU-FLATPAK-02"].remediation_cmd == "uv run aw-m17-diag refresh-steam"
+
+    report = SystemAuditReport(
+        kernel_release="7.0.0-43-generic",
+        cmdline="ro quiet splash nvme_core.default_ps_max_latency_us=0",
+        storage=replace(storage, apst_max_latency_us=0, sensor2_ctrl_temp_c=50.0),
+        memory=mem,
+        pcie_iommu=pcie,
+        gpu_display=stale_gpu,
+        thermal_power=tp,
+    )
+    ready, checks = evaluate_preflight(report=report, workload="gaming")
+    assert not ready
+    c_by_id = {c.check_id: c for c in checks}
+    assert c_by_id["PRE-GAME-GL"].severity == Severity.CRITICAL
+    assert c_by_id["PRE-GAME-GL"].remediation_cmd == "uv run aw-m17-diag refresh-steam"
+
+    applied, errors = refresh_steam_flatpak_sandbox(dry_run=True)
+    assert not errors
+    assert any("flatpak kill com.valvesoftware.Steam" in s for s in applied)
+    assert any("PipeWire/WirePlumber" in s for s in applied)
+    assert any("Relaunch com.valvesoftware.Steam" in s for s in applied)

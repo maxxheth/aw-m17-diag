@@ -19,6 +19,7 @@ from aw_m17_diag.engine.profiles import (
     configure_startup_profile,
     get_startup_profile_status,
     get_workload_profile,
+    refresh_steam_flatpak_sandbox,
 )
 from aw_m17_diag.models import WorkloadProfileName
 from aw_m17_diag.ui.console import (
@@ -161,6 +162,14 @@ def cmd_profile_set(
             help="Also configure this profile to load automatically on system startup.",
         ),
     ] = False,
+    refresh_steam: Annotated[
+        bool,
+        typer.Option(
+            "--refresh-steam",
+            "-r",
+            help="Also recycle the Steam Flatpak sandbox so updated NVIDIA GL/Vulkan mounts take effect.",
+        ),
+    ] = False,
     dry_run: Annotated[
         bool,
         typer.Option("--dry-run", help="Preview sysfs/procfs writes without mutating system."),
@@ -172,6 +181,45 @@ def cmd_profile_set(
         spec=spec,
         dry_run=dry_run,
         persist_startup=startup,
+    )
+    if refresh_steam:
+        steam_applied, steam_errors = refresh_steam_flatpak_sandbox(dry_run=dry_run)
+        applied = (*applied, *steam_applied)
+        errors = (*errors, *steam_errors)
+    for item in applied:
+        console.print(f"[green]✓[/green] {item}")
+    for err in errors:
+        console.print(f"[bold red]✗[/bold red] {err}")
+    if errors:
+        raise typer.Exit(code=1)
+
+
+@app.command("refresh-steam")
+def cmd_refresh_steam(
+    relaunch: Annotated[
+        bool,
+        typer.Option(
+            "--relaunch/--no-relaunch",
+            help="Automatically relaunch Steam after killing the stale Flatpak sandbox.",
+        ),
+    ] = True,
+    restart_audio: Annotated[
+        bool,
+        typer.Option(
+            "--restart-audio/--no-restart-audio",
+            help="Also restart user PipeWire/WirePlumber services and re-apply 512-sample quantum floor.",
+        ),
+    ] = True,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Preview actions without mutating running processes."),
+    ] = False,
+) -> None:
+    """Recycle the Steam Flatpak sandbox to fix 'Non-DX12 Video Card' after background Flatpak GL updates."""
+    applied, errors = refresh_steam_flatpak_sandbox(
+        relaunch=relaunch,
+        restart_audio=restart_audio,
+        dry_run=dry_run,
     )
     for item in applied:
         console.print(f"[green]✓[/green] {item}")

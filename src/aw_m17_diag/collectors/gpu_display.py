@@ -116,6 +116,25 @@ def _get_flatpak_nvidia_gl_versions() -> tuple[str, ...]:
     return tuple(sorted(versions))
 
 
+def _is_steam_flatpak_gl_mount_stale(proc_root: Path = Path("/proc")) -> bool:
+    """Detect if a running Steam Flatpak sandbox has a broken/unlinked nvidia_icd.json mount."""
+    if not proc_root.is_dir():
+        return False
+    for pid_dir in proc_root.glob("[0-9]*"):
+        if read_text_safe(pid_dir / "comm") != "steam":
+            continue
+        icd_dir = pid_dir / "root" / "usr" / "lib" / "x86_64-linux-gnu" / "GL" / "vulkan" / "icd.d"
+        try:
+            if not icd_dir.is_dir():
+                continue
+            nv_icd = icd_dir / "nvidia_icd.json"
+            if nv_icd.is_symlink() and not nv_icd.exists():
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _is_ucsi_blacklisted(modprobe_dir: Path = Path("/etc/modprobe.d")) -> bool:
     """Check if ucsi_ccg and i2c_nvidia_gpu are blacklisted in /etc/modprobe.d."""
     if not modprobe_dir.is_dir():
@@ -191,6 +210,7 @@ def collect_gpu_display(
         i915_workqueue_hog_count=max_hog_count,
         flatpak_nvidia_gl_versions=flatpak_gl_vers,
         flatpak_driver_mismatch=mismatch,
+        flatpak_steam_mount_stale=_is_steam_flatpak_gl_mount_stale(proc_root),
         gpu_clock_graphics_mhz=clock_gr,
         gpu_clock_mem_mhz=clock_mem,
         gpu_sw_thermal_slowdown=sw_therm_slowdown,
