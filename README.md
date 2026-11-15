@@ -23,15 +23,17 @@ uv run aw-m17-diag audit
 # Analyze previous boots for abrupt freezes, NULL-byte log cutoffs, OOM/SIGKILLs & DMAR bursts
 uv run aw-m17-diag crash-report --boots 5
 
-# Pre-flight readiness check before running heavy Ollama models or Steam gaming
+# Pre-flight readiness check before running heavy Ollama models, Steam gaming, or Unreal Engine 5
 uv run aw-m17-diag preflight --workload ollama --model-size-gb 22
+uv run aw-m17-diag preflight --workload unreal
 
 # Evaluate Tier 1 (Sysfs) vs Tier 2 (Boot Param) vs Tier 3 (Custom DKMS Driver) solutions
 uv run aw-m17-diag driver-advisor --export-dkms
 
-# View or apply workload profiles (extreme-performance, ollama-heavy, gaming-prime, balanced-daily, powersave)
+# View or apply workload profiles (extreme-performance, unreal-engine, ollama-heavy, gaming-prime, balanced-daily, powersave)
 uv run aw-m17-diag profile show
 sudo $(which uv) run aw-m17-diag profile set gaming-prime
+sudo $(which uv) run aw-m17-diag profile set unreal-engine
 
 # Configure or inspect the profile loaded automatically on system startup
 uv run aw-m17-diag profile startup --status

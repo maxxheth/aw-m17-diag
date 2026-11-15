@@ -28,6 +28,7 @@ class WorkloadProfileName(StrEnum):
     """Supported Alienware m17 tuning profiles."""
 
     EXTREME_PERFORMANCE = "extreme-performance"
+    UNREAL_ENGINE = "unreal-engine"
     OLLAMA_HEAVY = "ollama-heavy"
     GAMING_PRIME = "gaming-prime"
     BALANCED_DAILY = "balanced-daily"
@@ -82,6 +83,10 @@ class MemorySnapshot:
     dirty_ratio: int
     dirty_background_ratio: int
     dirty_pages_mib: float
+    max_map_count: int = 65530
+    inotify_max_user_instances: int = 128
+    inotify_max_user_watches: int = 8192
+    inotify_max_queued_events: int = 16384
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +207,13 @@ class WorkloadProfileSpec:
     gpu_max_clock_mhz: int | None = None
     gpu_vf_offset_mhz: int = 0
     quiesce_unplugged_alx: bool = False
+    evict_ollama_vram: bool = False
+    min_pipewire_quantum: int | None = None
+    disable_snd_hda_power_save: bool = False
+    min_max_map_count: int | None = None
+    min_inotify_user_instances: int | None = None
+    min_inotify_user_watches: int | None = None
+    min_inotify_queued_events: int | None = None
 
     def __post_init__(self) -> None:
         """Enforce hardware-safe domain invariants on profile parameters."""
@@ -214,6 +226,12 @@ class WorkloadProfileSpec:
             raise ValueError(
                 f"RAPL PL1 must be positive and <= PL2 "
                 f"(MSR {self.msr_pl1_w}/{self.msr_pl2_w}W, MMIO {self.mmio_pl1_w}/{self.mmio_pl2_w}W)."
+            )
+        if not (0 < self.dirty_background_ratio <= self.dirty_ratio <= 100):
+            raise ValueError(
+                "VM dirty writeback ratios must satisfy "
+                "0 < dirty_background_ratio <= dirty_ratio <= 100 "
+                f"(got bg={self.dirty_background_ratio}%, ratio={self.dirty_ratio}%)."
             )
         if not (0 <= self.gpu_vf_offset_mhz <= 250 and self.gpu_vf_offset_mhz % 15 == 0):
             raise ValueError(
@@ -228,6 +246,21 @@ class WorkloadProfileSpec:
                 "Positive GPU V/F undervolt offset requires an explicit 15 MHz-aligned "
                 f"gpu_max_clock_mhz ceiling in 300..1800 MHz (got {self.gpu_max_clock_mhz})."
             )
+        if self.min_pipewire_quantum is not None and not (32 <= self.min_pipewire_quantum <= 2048):
+            raise ValueError(
+                "PipeWire min_pipewire_quantum must stay within 32..2048 samples "
+                f"(got {self.min_pipewire_quantum})."
+            )
+        for field_name, floor_val in (
+            ("min_max_map_count", self.min_max_map_count),
+            ("min_inotify_user_instances", self.min_inotify_user_instances),
+            ("min_inotify_user_watches", self.min_inotify_user_watches),
+            ("min_inotify_queued_events", self.min_inotify_queued_events),
+        ):
+            if floor_val is not None and floor_val <= 0:
+                raise ValueError(
+                    f"Kernel sysctl floor {field_name} must be positive (got {floor_val})."
+                )
 
 
 @dataclass(frozen=True, slots=True)

@@ -14,14 +14,29 @@ from aw_m17_diag.engine.profiles import (
     GAMING_PRIME_FAN_BOOST_PCT,
     GAMING_PRIME_GPU_MAX_CLOCK_MHZ,
     GAMING_PRIME_GPU_VF_OFFSET_MHZ,
+    GAMING_PRIME_MIN_PIPEWIRE_QUANTUM,
     GAMING_PRIME_PL1_W,
     GAMING_PRIME_PL2_W,
     GAMING_PRIME_PLATFORM_PROFILE,
+    UNREAL_ENGINE_CPU_MAX_FREQ_KHZ,
+    UNREAL_ENGINE_DIRTY_BG_RATIO,
+    UNREAL_ENGINE_DIRTY_RATIO,
+    UNREAL_ENGINE_FAN_BOOST_PCT,
+    UNREAL_ENGINE_GPU_MAX_CLOCK_MHZ,
+    UNREAL_ENGINE_GPU_VF_OFFSET_MHZ,
+    UNREAL_ENGINE_MIN_INOTIFY_EVENTS,
+    UNREAL_ENGINE_MIN_INOTIFY_INSTANCES,
+    UNREAL_ENGINE_MIN_INOTIFY_WATCHES,
+    UNREAL_ENGINE_MIN_MAX_MAP_COUNT,
+    UNREAL_ENGINE_PL1_W,
+    UNREAL_ENGINE_PL2_W,
+    UNREAL_ENGINE_PLATFORM_PROFILE,
     apply_workload_profile,
     configure_startup_profile,
     get_startup_profile_status,
     get_workload_profile,
     verify_gaming_prime_invariants,
+    verify_unreal_engine_invariants,
     write_fan_boost,
 )
 from aw_m17_diag.models import (
@@ -226,8 +241,7 @@ def test_gaming_prime_unbinds_unplugged_alx_and_preserves_active_carrier(tmp_pat
     )
     assert not errors
     assert any(
-        f"platform-profile-0/profile <- {GAMING_PRIME_PLATFORM_PROFILE}" in item
-        for item in applied
+        f"platform-profile-0/profile <- {GAMING_PRIME_PLATFORM_PROFILE}" in item for item in applied
     )
     assert any(f"fan1_boost <- {GAMING_PRIME_FAN_BOOST_PCT}" in item for item in applied)
     assert any(f"fan2_boost <- {GAMING_PRIME_FAN_BOOST_PCT}" in item for item in applied)
@@ -241,10 +255,15 @@ def test_gaming_prime_unbinds_unplugged_alx_and_preserves_active_carrier(tmp_pat
         for item in applied
     )
     assert any(
-        f"NVML GPC V/F offset <- +{GAMING_PRIME_GPU_VF_OFFSET_MHZ} MHz" in item
-        for item in applied
+        f"NVML GPC V/F offset <- +{GAMING_PRIME_GPU_VF_OFFSET_MHZ} MHz" in item for item in applied
     )
     assert any(f"nvidia-smi -lgc 300,{GAMING_PRIME_GPU_MAX_CLOCK_MHZ}" in item for item in applied)
+    assert any("snd_hda_intel/parameters/power_save <- 0" in item for item in applied)
+    assert any("snd_hda_intel/parameters/power_save_controller <- N" in item for item in applied)
+    assert any(
+        f"PipeWire clock.min-quantum <- {GAMING_PRIME_MIN_PIPEWIRE_QUANTUM}" in item
+        for item in applied
+    )
 
     # Case 2: carrier = 1 (wired Ethernet connected) -> keep bound
     (iface_dir / "carrier").write_text("1\n", encoding="utf-8")
@@ -383,7 +402,9 @@ def test_leaving_custom_profile_zeroes_fan_boost_first(tmp_path: Path) -> None:
     assert not errors
     fan1_idx = next(i for i, s in enumerate(applied) if "fan1_boost <- 0" in s)
     fan2_idx = next(i for i, s in enumerate(applied) if "fan2_boost <- 0" in s)
-    prof_idx = next(i for i, s in enumerate(applied) if "platform-profile-0/profile <- balanced" in s)
+    prof_idx = next(
+        i for i, s in enumerate(applied) if "platform-profile-0/profile <- balanced" in s
+    )
     assert fan1_idx < prof_idx
     assert fan2_idx < prof_idx
 
@@ -428,6 +449,65 @@ def test_workload_profile_spec_enforces_domain_invariants() -> None:
             gpu_vf_offset_mhz=165,
         )
 
+    with pytest.raises(ValueError, match="dirty_background_ratio <= dirty_ratio"):
+        WorkloadProfileSpec(
+            name=WorkloadProfileName.UNREAL_ENGINE,
+            description="inverted dirty ratios",
+            platform_profile="custom",
+            epp="balance_performance",
+            msr_pl1_w=45,
+            msr_pl2_w=70,
+            mmio_pl1_w=45,
+            mmio_pl2_w=70,
+            swappiness=10,
+            dirty_ratio=4,
+            dirty_background_ratio=8,
+            cpu_fan_boost=100,
+            gpu_fan_boost=100,
+            gpu_max_clock_mhz=1560,
+            gpu_vf_offset_mhz=135,
+        )
+
+    with pytest.raises(ValueError, match="min_inotify_user_instances"):
+        WorkloadProfileSpec(
+            name=WorkloadProfileName.UNREAL_ENGINE,
+            description="bad floor",
+            platform_profile="custom",
+            epp="balance_performance",
+            msr_pl1_w=45,
+            msr_pl2_w=70,
+            mmio_pl1_w=45,
+            mmio_pl2_w=70,
+            swappiness=10,
+            dirty_ratio=6,
+            dirty_background_ratio=2,
+            cpu_fan_boost=100,
+            gpu_fan_boost=100,
+            gpu_max_clock_mhz=1560,
+            gpu_vf_offset_mhz=135,
+            min_inotify_user_instances=0,
+        )
+
+    with pytest.raises(ValueError, match="min_pipewire_quantum"):
+        WorkloadProfileSpec(
+            name=WorkloadProfileName.GAMING_PRIME,
+            description="bad quantum",
+            platform_profile="custom",
+            epp="balance_performance",
+            msr_pl1_w=38,
+            msr_pl2_w=60,
+            mmio_pl1_w=38,
+            mmio_pl2_w=60,
+            swappiness=10,
+            dirty_ratio=10,
+            dirty_background_ratio=5,
+            cpu_fan_boost=100,
+            gpu_fan_boost=100,
+            gpu_max_clock_mhz=1560,
+            gpu_vf_offset_mhz=135,
+            min_pipewire_quantum=16,
+        )
+
 
 def test_verify_gaming_prime_invariants_detects_drift(tmp_path: Path) -> None:
     """Verify verify_gaming_prime_invariants validates all sysfs invariants and catches drift."""
@@ -456,26 +536,251 @@ def test_verify_gaming_prime_invariants_detects_drift(tmp_path: Path) -> None:
 
     cpu0 = sys_root / "devices" / "system" / "cpu" / "cpu0" / "cpufreq"
     cpu0.mkdir(parents=True)
-    (cpu0 / "scaling_max_freq").write_text(
-        f"{GAMING_PRIME_CPU_MAX_FREQ_KHZ}\n", encoding="utf-8"
-    )
+    (cpu0 / "scaling_max_freq").write_text(f"{GAMING_PRIME_CPU_MAX_FREQ_KHZ}\n", encoding="utf-8")
+
+    hda_params = sys_root / "module" / "snd_hda_intel" / "parameters"
+    hda_params.mkdir(parents=True)
+    (hda_params / "power_save").write_text("0\n", encoding="utf-8")
+    (hda_params / "power_save_controller").write_text("N\n", encoding="utf-8")
 
     ok, violations = verify_gaming_prime_invariants(sys_root=sys_root, proc_root=proc_root)
     assert ok
     assert violations == ()
 
-    # Introduce drift in PL1 and fan2_boost
+    # Introduce drift in PL1, fan2_boost, and snd_hda_intel power_save
     (aw_hwmon / "fan2_boost").write_text("0\n", encoding="utf-8")
     (sys_root / "class" / "powercap" / "intel-rapl:0" / "constraint_0_power_limit_uw").write_text(
         "65000000\n", encoding="utf-8"
     )
+    (hda_params / "power_save").write_text("1\n", encoding="utf-8")
     ok_drift, drift_violations = verify_gaming_prime_invariants(
         sys_root=sys_root, proc_root=proc_root
     )
     assert not ok_drift
     assert any("gpu_fan_boost=0" in v for v in drift_violations)
     assert any("msr_pl1_w=65.0W" in v for v in drift_violations)
+    assert any("snd_hda_intel power_save=1" in v for v in drift_violations)
 
 
+def test_unreal_engine_profile_applies_custom_fans_undervolt_and_monotonic_floors(
+    tmp_path: Path,
+) -> None:
+    """Verify unreal-engine sets custom +100% fans, 45W/70W RAPL, +135MHz UV, and monotonic floors."""
+    sys_root = tmp_path / "sys"
+    proc_root = tmp_path / "proc"
+
+    pprof_dir = sys_root / "class" / "platform-profile" / "platform-profile-0"
+    pprof_dir.mkdir(parents=True)
+    (pprof_dir / "name").write_text("alienware-wmi\n", encoding="utf-8")
+    (pprof_dir / "profile").write_text("balanced-performance\n", encoding="utf-8")
+
+    aw_hwmon = sys_root / "class" / "hwmon" / "hwmon5"
+    aw_hwmon.mkdir(parents=True)
+    (aw_hwmon / "name").write_text("alienware_wmi\n", encoding="utf-8")
+    (aw_hwmon / "fan1_boost").write_text("0\n", encoding="utf-8")
+    (aw_hwmon / "fan2_boost").write_text("0\n", encoding="utf-8")
+
+    vm_dir = proc_root / "sys" / "vm"
+    vm_dir.mkdir(parents=True)
+    # Higher existing max_map_count should be preserved without lowering
+    (vm_dir / "max_map_count").write_text("2097152\n", encoding="utf-8")
+
+    inotify_dir = proc_root / "sys" / "fs" / "inotify"
+    inotify_dir.mkdir(parents=True)
+    # Undersized host default (128) should be raised to 2048
+    (inotify_dir / "max_user_instances").write_text("128\n", encoding="utf-8")
+    (inotify_dir / "max_user_watches").write_text("516437\n", encoding="utf-8")
+    (inotify_dir / "max_queued_events").write_text("16384\n", encoding="utf-8")
+
+    alx_drv = sys_root / "bus" / "pci" / "drivers" / "alx"
+    iface_dir = alx_drv / "0000:6f:00.0" / "net" / "enp111s0"
+    iface_dir.mkdir(parents=True)
+    (iface_dir / "carrier").write_text("0\n", encoding="utf-8")
+
+    hda_params = sys_root / "module" / "snd_hda_intel" / "parameters"
+    hda_params.mkdir(parents=True)
+    (hda_params / "power_save").write_text("1\n", encoding="utf-8")
+    (hda_params / "power_save_controller").write_text("Y\n", encoding="utf-8")
+
+    spec = get_workload_profile(WorkloadProfileName.UNREAL_ENGINE)
+    with patch("os.geteuid", return_value=0):
+        applied, errors = apply_workload_profile(
+            spec=spec,
+            dry_run=False,
+            sys_root=sys_root,
+            proc_root=proc_root,
+            run_dir=tmp_path / "run",
+            etc_dir=tmp_path / "etc",
+            sleep_dir=tmp_path / "sleep",
+        )
+    assert not errors
+    assert (pprof_dir / "profile").read_text(encoding="utf-8").strip() == "custom"
+    assert (aw_hwmon / "fan1_boost").read_text(encoding="utf-8").strip() == "100"
+    assert (aw_hwmon / "fan2_boost").read_text(encoding="utf-8").strip() == "100"
+    assert (vm_dir / "dirty_background_ratio").read_text(encoding="utf-8").strip() == "2"
+    assert (vm_dir / "dirty_ratio").read_text(encoding="utf-8").strip() == "6"
+    assert (vm_dir / "max_map_count").read_text(encoding="utf-8").strip() == "2097152"
+    assert any(">= 1048576 floor" in item for item in applied)
+    assert (inotify_dir / "max_user_instances").read_text(encoding="utf-8").strip() == str(
+        UNREAL_ENGINE_MIN_INOTIFY_INSTANCES
+    )
+    assert (inotify_dir / "max_user_watches").read_text(encoding="utf-8").strip() == str(
+        UNREAL_ENGINE_MIN_INOTIFY_WATCHES
+    )
+    assert (inotify_dir / "max_queued_events").read_text(encoding="utf-8").strip() == str(
+        UNREAL_ENGINE_MIN_INOTIFY_EVENTS
+    )
+    assert (hda_params / "power_save").read_text(encoding="utf-8").strip() == "0"
+    assert (hda_params / "power_save_controller").read_text(encoding="utf-8").strip() == "N"
+
+    # Also verify dry-run records NVML +135 MHz UV & -lgc 300,1560
+    dry_applied, dry_errors = apply_workload_profile(
+        spec=spec,
+        dry_run=True,
+        sys_root=sys_root,
+        proc_root=proc_root,
+    )
+    assert not dry_errors
+    assert any(
+        f"NVML GPC V/F offset <- +{UNREAL_ENGINE_GPU_VF_OFFSET_MHZ} MHz" in s for s in dry_applied
+    )
+    assert any(f"nvidia-smi -lgc 300,{UNREAL_ENGINE_GPU_MAX_CLOCK_MHZ}" in s for s in dry_applied)
 
 
+def test_verify_unreal_engine_invariants_detects_sysctl_and_rapl_drift(tmp_path: Path) -> None:
+    """Verify verify_unreal_engine_invariants checks RAPL, fans, dirty ratios, and inotify floors."""
+    sys_root = tmp_path / "sys"
+    proc_root = tmp_path / "proc"
+
+    acpi_dir = sys_root / "firmware" / "acpi"
+    acpi_dir.mkdir(parents=True)
+    (acpi_dir / "platform_profile").write_text(
+        f"{UNREAL_ENGINE_PLATFORM_PROFILE}\n", encoding="utf-8"
+    )
+
+    aw_hwmon = sys_root / "class" / "hwmon" / "hwmon5"
+    aw_hwmon.mkdir(parents=True)
+    (aw_hwmon / "name").write_text("alienware_wmi\n", encoding="utf-8")
+    (aw_hwmon / "fan1_boost").write_text(f"{UNREAL_ENGINE_FAN_BOOST_PCT}\n", encoding="utf-8")
+    (aw_hwmon / "fan2_boost").write_text(f"{UNREAL_ENGINE_FAN_BOOST_PCT}\n", encoding="utf-8")
+
+    for dom in ("intel-rapl:0", "intel-rapl-mmio:0"):
+        rdir = sys_root / "class" / "powercap" / dom
+        rdir.mkdir(parents=True)
+        (rdir / "constraint_0_power_limit_uw").write_text(
+            f"{UNREAL_ENGINE_PL1_W * 1_000_000}\n", encoding="utf-8"
+        )
+        (rdir / "constraint_1_power_limit_uw").write_text(
+            f"{UNREAL_ENGINE_PL2_W * 1_000_000}\n", encoding="utf-8"
+        )
+
+    cpu0 = sys_root / "devices" / "system" / "cpu" / "cpu0" / "cpufreq"
+    cpu0.mkdir(parents=True)
+    (cpu0 / "scaling_max_freq").write_text(f"{UNREAL_ENGINE_CPU_MAX_FREQ_KHZ}\n", encoding="utf-8")
+
+    vm_dir = proc_root / "sys" / "vm"
+    vm_dir.mkdir(parents=True)
+    (vm_dir / "dirty_ratio").write_text(f"{UNREAL_ENGINE_DIRTY_RATIO}\n", encoding="utf-8")
+    (vm_dir / "dirty_background_ratio").write_text(
+        f"{UNREAL_ENGINE_DIRTY_BG_RATIO}\n", encoding="utf-8"
+    )
+    (vm_dir / "max_map_count").write_text(f"{UNREAL_ENGINE_MIN_MAX_MAP_COUNT}\n", encoding="utf-8")
+
+    inotify_dir = proc_root / "sys" / "fs" / "inotify"
+    inotify_dir.mkdir(parents=True)
+    (inotify_dir / "max_user_instances").write_text(
+        f"{UNREAL_ENGINE_MIN_INOTIFY_INSTANCES}\n", encoding="utf-8"
+    )
+    (inotify_dir / "max_user_watches").write_text(
+        f"{UNREAL_ENGINE_MIN_INOTIFY_WATCHES}\n", encoding="utf-8"
+    )
+    (inotify_dir / "max_queued_events").write_text(
+        f"{UNREAL_ENGINE_MIN_INOTIFY_EVENTS}\n", encoding="utf-8"
+    )
+
+    ok, violations = verify_unreal_engine_invariants(sys_root=sys_root, proc_root=proc_root)
+    assert ok
+    assert violations == ()
+
+    # Drift inotify instances back to 128 and dirty_ratio to 10
+    (inotify_dir / "max_user_instances").write_text("128\n", encoding="utf-8")
+    (vm_dir / "dirty_ratio").write_text("10\n", encoding="utf-8")
+    ok_drift, drift_violations = verify_unreal_engine_invariants(
+        sys_root=sys_root, proc_root=proc_root
+    )
+    assert not ok_drift
+    assert any("fs.inotify.max_user_instances=128" in v for v in drift_violations)
+    assert any("dirty_ratio=10%" in v for v in drift_violations)
+
+
+def test_evaluate_preflight_unreal_checks_vram_invariants_and_inotify() -> None:
+    """Verify --workload unreal evaluates 8 GB GDDR6 VRAM headroom, invariants, and inotify."""
+    from dataclasses import replace
+
+    storage, pcie, gpu, tp = make_sample_snapshots()
+    healthy_storage = replace(storage, apst_max_latency_us=0, sensor2_ctrl_temp_c=48.0)
+    healthy_gpu = replace(
+        gpu,
+        gpu_temp_c=52,
+        gpu_power_cap_w=90.0,
+        gpu_pstate="P0",
+        gpu_vram_used_mib=700,
+        gpu_vram_total_mib=8192,
+        gpu_sw_thermal_slowdown=False,
+        gpu_vf_offset_mhz=UNREAL_ENGINE_GPU_VF_OFFSET_MHZ,
+    )
+    healthy_tp = replace(
+        tp,
+        platform_profile=UNREAL_ENGINE_PLATFORM_PROFILE,
+        cpu_fan_boost=UNREAL_ENGINE_FAN_BOOST_PCT,
+        gpu_fan_boost=UNREAL_ENGINE_FAN_BOOST_PCT,
+        msr_pl1_w=float(UNREAL_ENGINE_PL1_W),
+        msr_pl2_w=float(UNREAL_ENGINE_PL2_W),
+    )
+    healthy_mem = MemorySnapshot(
+        ram_total_gib=62.6,
+        ram_available_gib=48.0,
+        ram_used_percent=23.0,
+        swap_total_gib=32.0,
+        swap_free_gib=32.0,
+        swap_used_percent=0.0,
+        swappiness=10,
+        vfs_cache_pressure=50,
+        dirty_ratio=UNREAL_ENGINE_DIRTY_RATIO,
+        dirty_background_ratio=UNREAL_ENGINE_DIRTY_BG_RATIO,
+        dirty_pages_mib=4.0,
+        max_map_count=UNREAL_ENGINE_MIN_MAX_MAP_COUNT,
+        inotify_max_user_instances=UNREAL_ENGINE_MIN_INOTIFY_INSTANCES,
+        inotify_max_user_watches=UNREAL_ENGINE_MIN_INOTIFY_WATCHES,
+        inotify_max_queued_events=UNREAL_ENGINE_MIN_INOTIFY_EVENTS,
+    )
+    report_ok = SystemAuditReport(
+        kernel_release="7.0.0-42-generic",
+        cmdline="ro quiet splash nvme_core.default_ps_max_latency_us=0",
+        storage=healthy_storage,
+        memory=healthy_mem,
+        pcie_iommu=pcie,
+        gpu_display=healthy_gpu,
+        thermal_power=healthy_tp,
+    )
+    ready, checks = evaluate_preflight(report=report_ok, workload="unreal")
+    assert ready
+    assert all(c.severity == Severity.PASS for c in checks)
+
+    # Simulate 6200 MiB VRAM already occupied (< 3072 MiB free) and inotify=128
+    starved_gpu = replace(healthy_gpu, gpu_vram_used_mib=6200)
+    untuned_mem = replace(healthy_mem, inotify_max_user_instances=128)
+    report_starved = replace(report_ok, gpu_display=starved_gpu, memory=untuned_mem)
+    ready_starved, starved_checks = evaluate_preflight(report=report_starved, workload="unreal")
+    assert not ready_starved
+    by_id = {c.check_id: c for c in starved_checks}
+    assert by_id["PRE-UE-VRAM"].severity == Severity.CRITICAL
+    assert by_id["PRE-UE-SYSCTL"].severity == Severity.WARN
+
+    # Also verify gaming preflight flags PRE-GAME-VRAM CRITICAL when >6 GiB VRAM is pinned
+    ready_game_starved, game_starved_checks = evaluate_preflight(
+        report=report_starved, workload="gaming"
+    )
+    assert not ready_game_starved
+    game_by_id = {c.check_id: c for c in game_starved_checks}
+    assert game_by_id["PRE-GAME-VRAM"].severity == Severity.CRITICAL

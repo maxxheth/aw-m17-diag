@@ -22,6 +22,12 @@ def collect_memory(proc_root: Path = Path("/proc")) -> MemorySnapshot:
     vfs_pressure = read_int_safe(vm_sys / "vfs_cache_pressure", default=100) or 100
     dirty_ratio = read_int_safe(vm_sys / "dirty_ratio", default=20) or 20
     dirty_bg_ratio = read_int_safe(vm_sys / "dirty_background_ratio", default=10) or 10
+    max_map_count = read_int_safe(vm_sys / "max_map_count", default=65530) or 65530
+
+    inotify_sys = proc_root / "sys" / "fs" / "inotify"
+    inotify_instances = read_int_safe(inotify_sys / "max_user_instances", default=128) or 128
+    inotify_watches = read_int_safe(inotify_sys / "max_user_watches", default=8192) or 8192
+    inotify_events = read_int_safe(inotify_sys / "max_queued_events", default=16384) or 16384
 
     dirty_kib = 0
     meminfo = read_text_safe(proc_root / "meminfo")
@@ -44,4 +50,8 @@ def collect_memory(proc_root: Path = Path("/proc")) -> MemorySnapshot:
         dirty_ratio=dirty_ratio,
         dirty_background_ratio=dirty_bg_ratio,
         dirty_pages_mib=round(dirty_kib / 1024.0, 2),
+        max_map_count=max_map_count,
+        inotify_max_user_instances=inotify_instances,
+        inotify_max_user_watches=inotify_watches,
+        inotify_max_queued_events=inotify_events,
     )

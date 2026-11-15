@@ -221,18 +221,27 @@ def render_preflight_report(
         if ready
         else "[bold white on red]NOT SAFE — CRITICAL RISKS DETECTED[/bold white on red]"
     )
+    w_lower = workload.lower()
+    if w_lower == "ollama":
+        subtitle = f"(Target Model Size: {model_size_gb:.1f} GB)"
+    elif w_lower == "unreal":
+        subtitle = "(UE5 Editor + Vulkan SM6 + ShaderCompileWorker)"
+    elif w_lower == "gaming":
+        subtitle = "(60Hz PRIME + NVML Undervolt)"
+    else:
+        subtitle = f"({workload})"
     console.print(
         Panel.fit(
             f"[bold cyan]Pre-Flight Workload Check:[/bold cyan] [bold]{workload.upper()}[/bold] "
-            f"(Target Model Size: {model_size_gb:.1f} GB) — {status_text}",
+            f"{subtitle} — {status_text}",
             border_style="green" if ready else "red",
         )
     )
-    table = Table(show_lines=True)
-    table.add_column("Check ID", width=16)
-    table.add_column("Status", width=10)
-    table.add_column("Assessment", width=48)
-    table.add_column("Current vs. Required", width=36)
+    table = Table(show_lines=True, expand=True)
+    table.add_column("Check ID", style="dim", min_width=13, ratio=14)
+    table.add_column("Status", min_width=9, ratio=10)
+    table.add_column("Assessment", ratio=44)
+    table.add_column("Current vs. Required", ratio=32)
 
     for chk in checks:
         table.add_row(
@@ -307,7 +316,9 @@ def render_profiles_table(
             else "[dim]none[/dim]"
         )
         hook_label = (
-            "[green]active[/green]" if startup_status.sleep_hook_installed else "[yellow]missing[/yellow]"
+            "[green]active[/green]"
+            if startup_status.sleep_hook_installed
+            else "[yellow]missing[/yellow]"
         )
         startup_line = (
             f"\nStartup Boot Profile: {s_label} | "

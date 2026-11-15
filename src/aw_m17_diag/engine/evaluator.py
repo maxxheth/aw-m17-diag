@@ -19,6 +19,17 @@ from aw_m17_diag.engine.profiles import (
     GAMING_PRIME_PL1_W,
     GAMING_PRIME_PL2_W,
     GAMING_PRIME_PLATFORM_PROFILE,
+    UNREAL_ENGINE_DIRTY_BG_RATIO,
+    UNREAL_ENGINE_DIRTY_RATIO,
+    UNREAL_ENGINE_FAN_BOOST_PCT,
+    UNREAL_ENGINE_GPU_MAX_CLOCK_MHZ,
+    UNREAL_ENGINE_GPU_VF_OFFSET_MHZ,
+    UNREAL_ENGINE_MIN_INOTIFY_INSTANCES,
+    UNREAL_ENGINE_MIN_INOTIFY_WATCHES,
+    UNREAL_ENGINE_MIN_MAX_MAP_COUNT,
+    UNREAL_ENGINE_PL1_W,
+    UNREAL_ENGINE_PL2_W,
+    UNREAL_ENGINE_PLATFORM_PROFILE,
 )
 from aw_m17_diag.models import (
     GpuDisplaySnapshot,
@@ -453,8 +464,9 @@ def evaluate_preflight(
     workload: str = "ollama",
     model_size_gb: float = 22.0,
 ) -> tuple[bool, tuple[HealthFinding, ...]]:
-    """Evaluate readiness for an upcoming 'ollama' or 'gaming' workload."""
+    """Evaluate readiness for an upcoming 'ollama', 'gaming', or 'unreal' workload."""
     checks: list[HealthFinding] = []
+    w = workload.lower()
 
     # 1. NVMe APST must be disabled before any heavy I/O workload
     apst_disabled = report.storage.apst_max_latency_us == 0
@@ -572,6 +584,44 @@ def evaluate_preflight(
                 remediation_cmd="sudo $(which uv) run aw-m17-diag profile set gaming-prime",
             )
         )
+        vram_free_mib: int | None = None
+        if gd.gpu_vram_total_mib is not None and gd.gpu_vram_used_mib is not None:
+            vram_free_mib = max(0, gd.gpu_vram_total_mib - gd.gpu_vram_used_mib)
+        if vram_free_mib is None:
+            game_vram_sev = Severity.WARN
+            game_vram_cur = "Unknown (nvidia-smi unavailable)"
+        elif vram_free_mib >= 6144:
+            game_vram_sev = Severity.PASS
+            game_vram_cur = (
+                f"Free={vram_free_mib} MiB (Used={gd.gpu_vram_used_mib}/{gd.gpu_vram_total_mib} MiB)"
+            )
+        elif vram_free_mib >= 3072:
+            game_vram_sev = Severity.WARN
+            game_vram_cur = (
+                f"Free={vram_free_mib} MiB (Used={gd.gpu_vram_used_mib}/{gd.gpu_vram_total_mib} MiB)"
+            )
+        else:
+            game_vram_sev = Severity.CRITICAL
+            game_vram_cur = (
+                f"Free={vram_free_mib} MiB (Used={gd.gpu_vram_used_mib}/{gd.gpu_vram_total_mib} MiB)"
+            )
+        checks.append(
+            HealthFinding(
+                check_id="PRE-GAME-VRAM",
+                subsystem="DX12 / Vulkan VRAM",
+                title="RTX 2070 Max-Q (8 GB) Free GDDR6 Headroom (No Background CUDA / Ollama Pinning)",
+                severity=game_vram_sev,
+                current_value=game_vram_cur,
+                expected_value=">= 6144 MiB free before launch (no resident llama-server models)",
+                explanation=(
+                    "DX12/vkd3d-proton titles (e.g. AC Mirage) require 5.0-6.5 GiB of GDDR6; "
+                    "a resident Ollama llama-server model pinning >5 GiB VRAM forces PCIe system-RAM "
+                    "spillover and catastrophic framerate collapse."
+                ),
+                remediation_tier=RemediationTier.TIER_1_USERSPACE_SYSFS,
+                remediation_cmd="ollama ps && sudo $(which uv) run aw-m17-diag profile set gaming-prime",
+            )
+        )
         checks.append(
             HealthFinding(
                 check_id="PRE-GAME-GL",
@@ -590,8 +640,171 @@ def evaluate_preflight(
             )
         )
 
+    elif w == "unreal":
+        gd = report.gpu_display
+        tp = report.thermal_power
+        mem = report.memory
+
+        gpu_clamped = (gd.gpu_power_cap_w is not None and gd.gpu_power_cap_w < 60.0) or (
+            gd.gpu_sw_thermal_slowdown and (gd.gpu_temp_c is not None and gd.gpu_temp_c < 75)
+        )
+        checks.append(
+            HealthFinding(
+                check_id="PRE-UE-GPU",
+                subsystem="RTX 2070 Power Cap",
+                title="RTX 2070 Max-Q 90W TGP & GDDR6 Clock Unclamped for Vulkan SM6",
+                severity=Severity.CRITICAL if gpu_clamped else Severity.PASS,
+                current_value=(
+                    f"Cap={gd.gpu_power_cap_w}W, PState={gd.gpu_pstate}, "
+                    f"VRAM={gd.gpu_clock_mem_mhz} MHz, Profile={tp.platform_profile}"
+                ),
+                expected_value="Cap=90.0W (P0 / 6001 MHz under load), SW_Therm_Slowdown=False",
+                explanation=(
+                    "Detects the 30W / P5 (810 MHz VRAM) clamp after S3 resume or EC custom switch, "
+                    "which cuts GDDR6 bandwidth by 86.5% and stalls Lumen/Nanite viewports."
+                ),
+                remediation_tier=RemediationTier.TIER_1_USERSPACE_SYSFS,
+                remediation_cmd="sudo $(which uv) run aw-m17-diag profile set unreal-engine",
+            )
+        )
+
+        ue_invariants_active = (
+            tp.platform_profile == UNREAL_ENGINE_PLATFORM_PROFILE
+            and tp.cpu_fan_boost == UNREAL_ENGINE_FAN_BOOST_PCT
+            and tp.gpu_fan_boost == UNREAL_ENGINE_FAN_BOOST_PCT
+            and tp.msr_pl1_w is not None
+            and abs(tp.msr_pl1_w - UNREAL_ENGINE_PL1_W) <= 0.5
+            and gd.gpu_vf_offset_mhz == UNREAL_ENGINE_GPU_VF_OFFSET_MHZ
+            and mem.dirty_ratio == UNREAL_ENGINE_DIRTY_RATIO
+            and mem.dirty_background_ratio == UNREAL_ENGINE_DIRTY_BG_RATIO
+        )
+        checks.append(
+            HealthFinding(
+                check_id="PRE-UE-INV",
+                subsystem="unreal-engine Invariants",
+                title=(
+                    f"Exhaust Fan Boost (+{UNREAL_ENGINE_FAN_BOOST_PCT}%), "
+                    f"NVML Undervolt (+{UNREAL_ENGINE_GPU_VF_OFFSET_MHZ}MHz), "
+                    f"{UNREAL_ENGINE_PL1_W}W/{UNREAL_ENGINE_PL2_W}W RAPL & "
+                    f"{UNREAL_ENGINE_DIRTY_BG_RATIO}%/{UNREAL_ENGINE_DIRTY_RATIO}% Writeback"
+                ),
+                severity=Severity.PASS if ue_invariants_active else Severity.WARN,
+                current_value=(
+                    f"Profile={tp.platform_profile}, "
+                    f"FanBoost={tp.cpu_fan_boost}/{tp.gpu_fan_boost}%, "
+                    f"PL1/PL2={tp.msr_pl1_w}/{tp.msr_pl2_w}W, "
+                    f"UV={gd.gpu_vf_offset_mhz or 0:+d}MHz, "
+                    f"Dirty={mem.dirty_background_ratio}/{mem.dirty_ratio}%"
+                ),
+                expected_value=(
+                    f"Profile={UNREAL_ENGINE_PLATFORM_PROFILE}, "
+                    f"FanBoost={UNREAL_ENGINE_FAN_BOOST_PCT}/{UNREAL_ENGINE_FAN_BOOST_PCT}%, "
+                    f"PL1/PL2={UNREAL_ENGINE_PL1_W}/{UNREAL_ENGINE_PL2_W}W, "
+                    f"UV=+{UNREAL_ENGINE_GPU_VF_OFFSET_MHZ}MHz @ <={UNREAL_ENGINE_GPU_MAX_CLOCK_MHZ}MHz, "
+                    f"Dirty={UNREAL_ENGINE_DIRTY_BG_RATIO}/{UNREAL_ENGINE_DIRTY_RATIO}%"
+                ),
+                explanation=(
+                    "Balances 12-thread ShaderCompileWorker/clang++ bursts against an active "
+                    "3D Editor viewport without shared-heatpipe soak, Xid 109 crashes, or DDC stalls."
+                ),
+                remediation_tier=RemediationTier.TIER_1_USERSPACE_SYSFS,
+                remediation_cmd="sudo $(which uv) run aw-m17-diag profile set unreal-engine",
+            )
+        )
+
+        vram_free_mib: int | None = None
+        if gd.gpu_vram_total_mib is not None and gd.gpu_vram_used_mib is not None:
+            vram_free_mib = max(0, gd.gpu_vram_total_mib - gd.gpu_vram_used_mib)
+        if vram_free_mib is None:
+            vram_sev = Severity.WARN
+            vram_cur = "Unknown (nvidia-smi unavailable)"
+        elif vram_free_mib >= 6144:
+            vram_sev = Severity.PASS
+            vram_cur = f"Free={vram_free_mib} MiB (Used={gd.gpu_vram_used_mib}/{gd.gpu_vram_total_mib} MiB)"
+        elif vram_free_mib >= 3072:
+            vram_sev = Severity.WARN
+            vram_cur = f"Free={vram_free_mib} MiB (Used={gd.gpu_vram_used_mib}/{gd.gpu_vram_total_mib} MiB)"
+        else:
+            vram_sev = Severity.CRITICAL
+            vram_cur = f"Free={vram_free_mib} MiB (Used={gd.gpu_vram_used_mib}/{gd.gpu_vram_total_mib} MiB)"
+        checks.append(
+            HealthFinding(
+                check_id="PRE-UE-VRAM",
+                subsystem="UE5 GDDR6 Budget",
+                title="RTX 2070 Max-Q (8 GB) Free VRAM Headroom for Lumen / Nanite / VSM",
+                severity=vram_sev,
+                current_value=vram_cur,
+                expected_value=">= 6144 MiB free (>= 3072 MiB minimum on 8192 MiB TU106)",
+                explanation=(
+                    "UE 5.8 Vulkan SM6 + Lumen + Virtual Shadow Maps quickly exhausts 8 GB GDDR6 "
+                    "if competing desktop/browser clients hold >2 GiB VRAM."
+                ),
+                remediation_tier=RemediationTier.TIER_1_USERSPACE_SYSFS,
+                remediation_cmd="Close GPU-heavy desktop/browser apps or cap r.Streaming.PoolSize=2000",
+            )
+        )
+
+        if mem.ram_available_gib >= 24.0 and mem.swap_free_gib >= 16.0:
+            ue_mem_sev = Severity.PASS
+        elif mem.ram_available_gib >= 16.0 and (mem.ram_available_gib + mem.swap_free_gib) >= 32.0:
+            ue_mem_sev = Severity.WARN
+        else:
+            ue_mem_sev = Severity.CRITICAL
+        checks.append(
+            HealthFinding(
+                check_id="PRE-UE-MEM",
+                subsystem="UBT / SCW Memory",
+                title="System RAM + Swap Headroom for UnrealEditor + 12x ShaderCompileWorker / clang++",
+                severity=ue_mem_sev,
+                current_value=f"Avail RAM={mem.ram_available_gib} GiB, Free Swap={mem.swap_free_gib} GiB",
+                expected_value=">= 24.0 GiB avail RAM & >= 16.0 GiB free swap",
+                explanation=(
+                    "Parallel C++ UnrealBuildTool (clang++/lld ~2 GiB/TU x 12) + UnrealEditor + "
+                    "ZenServer require ample RAM and swap headroom to avoid OOM kills."
+                ),
+                remediation_tier=RemediationTier.TIER_1_USERSPACE_SYSFS,
+                remediation_cmd="sudo /var/www/aw-m17-diag/scripts/aw-m17-stabilize.sh --apply",
+            )
+        )
+
+        if mem.max_map_count < 262_144:
+            sys_sev = Severity.CRITICAL
+        elif (
+            mem.max_map_count < UNREAL_ENGINE_MIN_MAX_MAP_COUNT
+            or mem.inotify_max_user_instances < UNREAL_ENGINE_MIN_INOTIFY_INSTANCES
+            or mem.inotify_max_user_watches < UNREAL_ENGINE_MIN_INOTIFY_WATCHES
+        ):
+            sys_sev = Severity.WARN
+        else:
+            sys_sev = Severity.PASS
+        checks.append(
+            HealthFinding(
+                check_id="PRE-UE-SYSCTL",
+                subsystem="Linux Watchers / VMA",
+                title="File-Watcher (fs.inotify) & Virtual Memory Area (vm.max_map_count) Limits",
+                severity=sys_sev,
+                current_value=(
+                    f"instances={mem.inotify_max_user_instances}, "
+                    f"watches={mem.inotify_max_user_watches}, "
+                    f"map_count={mem.max_map_count}"
+                ),
+                expected_value=(
+                    f"instances>={UNREAL_ENGINE_MIN_INOTIFY_INSTANCES}, "
+                    f"watches>={UNREAL_ENGINE_MIN_INOTIFY_WATCHES}, "
+                    f"map_count>={UNREAL_ENGINE_MIN_MAX_MAP_COUNT}"
+                ),
+                explanation=(
+                    "Prevents EMFILE watcher exhaustion across FDirectoryWatcherLinux + ZenServer "
+                    "+ IDE and mmap ENOMEM failures in Vulkan RHI / World Partition / lld."
+                ),
+                remediation_tier=RemediationTier.TIER_1_USERSPACE_SYSFS,
+                remediation_cmd="sudo $(which uv) run aw-m17-diag profile set unreal-engine",
+            )
+        )
+
     # Check NVMe Controller Temp (Sensor 2)
     ctrl_temp = report.storage.sensor2_ctrl_temp_c or 0.0
+    target_prof = {"unreal": "unreal-engine", "gaming": "gaming-prime"}.get(w, "ollama-heavy")
     checks.append(
         HealthFinding(
             check_id="PRE-THERM-NVME",
@@ -602,7 +815,7 @@ def evaluate_preflight(
             expected_value="< 70.0°C before starting load",
             explanation="DRAM-less controller throttles heavily above 78°C.",
             remediation_tier=RemediationTier.TIER_1_USERSPACE_SYSFS,
-            remediation_cmd="sudo uv run aw-m17-diag profile set ollama-heavy",
+            remediation_cmd=f"sudo $(which uv) run aw-m17-diag profile set {target_prof}",
         )
     )
 

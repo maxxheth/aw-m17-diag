@@ -6,6 +6,7 @@ import ctypes
 import errno
 import os
 import platform
+import pwd
 from pathlib import Path
 
 from aw_m17_diag.collectors._utils import (
@@ -39,6 +40,23 @@ GAMING_PRIME_PL2_W = 60
 GAMING_PRIME_CPU_MAX_FREQ_KHZ = 4_500_000
 GAMING_PRIME_GPU_MAX_CLOCK_MHZ = 1560
 GAMING_PRIME_GPU_VF_OFFSET_MHZ = 135
+GAMING_PRIME_MIN_PIPEWIRE_QUANTUM = 512
+
+# Core configuration invariants for the unreal-engine workload profile (UE 5.8 + Vulkan SM6)
+UNREAL_ENGINE_PLATFORM_PROFILE = "custom"
+UNREAL_ENGINE_FAN_BOOST_PCT = 100
+UNREAL_ENGINE_PL1_W = 45
+UNREAL_ENGINE_PL2_W = 70
+UNREAL_ENGINE_CPU_MAX_FREQ_KHZ = 4_500_000
+UNREAL_ENGINE_GPU_MAX_CLOCK_MHZ = 1560
+UNREAL_ENGINE_GPU_VF_OFFSET_MHZ = 135
+UNREAL_ENGINE_MIN_PIPEWIRE_QUANTUM = 512
+UNREAL_ENGINE_DIRTY_RATIO = 6
+UNREAL_ENGINE_DIRTY_BG_RATIO = 2
+UNREAL_ENGINE_MIN_MAX_MAP_COUNT = 1_048_576
+UNREAL_ENGINE_MIN_INOTIFY_INSTANCES = 2048
+UNREAL_ENGINE_MIN_INOTIFY_WATCHES = 1_048_576
+UNREAL_ENGINE_MIN_INOTIFY_EVENTS = 65_536
 
 PROFILES: dict[WorkloadProfileName, WorkloadProfileSpec] = {
     WorkloadProfileName.EXTREME_PERFORMANCE: WorkloadProfileSpec(
@@ -62,6 +80,37 @@ PROFILES: dict[WorkloadProfileName, WorkloadProfileSpec] = {
         cpu_max_freq_khz=4_500_000,
         gpu_max_clock_mhz=None,
         quiesce_unplugged_alx=True,
+    ),
+    WorkloadProfileName.UNREAL_ENGINE: WorkloadProfileSpec(
+        name=WorkloadProfileName.UNREAL_ENGINE,
+        description=(
+            "Bimodal Unreal Engine 5.8 workstation profile (Lumen/Nanite viewport + 12T "
+            "ShaderCompileWorker/clang++ bursts): AWCC 'custom' +100% dual exhaust fans, "
+            "45W/70W RAPL (4.50GHz 1T boost preserved), +135MHz NVML V/F undervolt @ 1560MHz "
+            "(Xid 109 guardband), 2%/6% SM2268XT DDC writeback, and inotify/VMA floors."
+        ),
+        platform_profile=UNREAL_ENGINE_PLATFORM_PROFILE,
+        epp="balance_performance",
+        msr_pl1_w=UNREAL_ENGINE_PL1_W,
+        msr_pl2_w=UNREAL_ENGINE_PL2_W,
+        mmio_pl1_w=UNREAL_ENGINE_PL1_W,
+        mmio_pl2_w=UNREAL_ENGINE_PL2_W,
+        swappiness=10,
+        dirty_ratio=UNREAL_ENGINE_DIRTY_RATIO,
+        dirty_background_ratio=UNREAL_ENGINE_DIRTY_BG_RATIO,
+        cpu_fan_boost=UNREAL_ENGINE_FAN_BOOST_PCT,
+        gpu_fan_boost=UNREAL_ENGINE_FAN_BOOST_PCT,
+        cpu_max_freq_khz=UNREAL_ENGINE_CPU_MAX_FREQ_KHZ,
+        gpu_max_clock_mhz=UNREAL_ENGINE_GPU_MAX_CLOCK_MHZ,
+        gpu_vf_offset_mhz=UNREAL_ENGINE_GPU_VF_OFFSET_MHZ,
+        quiesce_unplugged_alx=True,
+        evict_ollama_vram=True,
+        min_pipewire_quantum=UNREAL_ENGINE_MIN_PIPEWIRE_QUANTUM,
+        disable_snd_hda_power_save=True,
+        min_max_map_count=UNREAL_ENGINE_MIN_MAX_MAP_COUNT,
+        min_inotify_user_instances=UNREAL_ENGINE_MIN_INOTIFY_INSTANCES,
+        min_inotify_user_watches=UNREAL_ENGINE_MIN_INOTIFY_WATCHES,
+        min_inotify_queued_events=UNREAL_ENGINE_MIN_INOTIFY_EVENTS,
     ),
     WorkloadProfileName.OLLAMA_HEAVY: WorkloadProfileSpec(
         name=WorkloadProfileName.OLLAMA_HEAVY,
@@ -105,6 +154,9 @@ PROFILES: dict[WorkloadProfileName, WorkloadProfileSpec] = {
         gpu_max_clock_mhz=GAMING_PRIME_GPU_MAX_CLOCK_MHZ,
         gpu_vf_offset_mhz=GAMING_PRIME_GPU_VF_OFFSET_MHZ,
         quiesce_unplugged_alx=True,
+        evict_ollama_vram=True,
+        min_pipewire_quantum=GAMING_PRIME_MIN_PIPEWIRE_QUANTUM,
+        disable_snd_hda_power_save=True,
     ),
     WorkloadProfileName.BALANCED_DAILY: WorkloadProfileSpec(
         name=WorkloadProfileName.BALANCED_DAILY,
@@ -163,6 +215,22 @@ def _write_sysfs(
         applied.append(f"{path} <- {value}")
     except OSError as exc:
         errors.append(f"{path}: {exc}")
+
+
+def _ensure_sysctl_floor(
+    path: Path,
+    min_value: int,
+    applied: list[str],
+    errors: list[str],
+    dry_run: bool,
+) -> None:
+    """Ensure a procfs integer sysctl is at least min_value without lowering higher overrides."""
+    current = read_int_safe(path)
+    if current is not None and current >= min_value:
+        prefix = "[DRY-RUN] " if dry_run else ""
+        applied.append(f"{prefix}{path} == {current} (>= {min_value} floor)")
+        return
+    _write_sysfs(path, str(min_value), applied, errors, dry_run)
 
 
 def _find_alienware_platform_profile_file(sys_root: Path) -> Path | None:
@@ -282,7 +350,9 @@ def _apply_platform_profile_and_fans(
     if target_prof_path.exists() or dry_run:
         _write_sysfs(target_prof_path, spec.platform_profile, applied, errors, dry_run)
 
-    if aw_hwmon is not None and not (zeroed_before_switch and spec.cpu_fan_boost == 0 and spec.gpu_fan_boost == 0):
+    if aw_hwmon is not None and not (
+        zeroed_before_switch and spec.cpu_fan_boost == 0 and spec.gpu_fan_boost == 0
+    ):
         write_fan_boost(
             aw_hwmon / "fan1_boost",
             spec.cpu_fan_boost,
@@ -397,6 +467,132 @@ def _unclamp_nvidia_s3_power_state(applied: list[str], errors: list[str]) -> Non
     )
 
 
+def _evict_ollama_vram_models(
+    spec: WorkloadProfileSpec,
+    sys_root: Path,
+    applied: list[str],
+    errors: list[str],
+    dry_run: bool,
+) -> None:
+    """Unload any resident Ollama models pinning RTX 2070 Max-Q GDDR6 VRAM before gaming/UE5."""
+    if not spec.evict_ollama_vram:
+        return
+    if dry_run:
+        applied.append("[DRY-RUN] ollama ps -> unload resident VRAM models (if any)")
+        return
+    if sys_root != Path("/sys"):
+        return
+
+    rc, out = run_cmd_safe(["ollama", "ps"])
+    if rc != 0:
+        return
+
+    models: list[str] = []
+    for idx, line in enumerate(out.splitlines()):
+        stripped = line.strip()
+        if idx == 0 or not stripped:
+            continue
+        parts = stripped.split()
+        if parts:
+            models.append(parts[0])
+
+    if not models:
+        applied.append("Ollama VRAM check: 0 resident models loaded (full 8 GiB GDDR6 free)")
+        return
+
+    for model_name in models:
+        stop_rc, stop_out = run_cmd_safe(["ollama", "stop", model_name])
+        if stop_rc == 0:
+            applied.append(
+                f"ollama stop {model_name} (freed pinned GDDR6 VRAM for {spec.name.value})"
+            )
+        else:
+            errors.append(f"ollama stop {model_name} failed: {stop_out.strip()}")
+
+
+def _enforce_low_crackling_audio(
+    spec: WorkloadProfileSpec,
+    sys_root: Path,
+    proc_root: Path,
+    applied: list[str],
+    errors: list[str],
+    dry_run: bool,
+) -> None:
+    """Eliminate audio crackling/XRUNs by disabling HDA power-save and raising PipeWire quantum/RT."""
+    if spec.disable_snd_hda_power_save:
+        hda_params = sys_root / "module" / "snd_hda_intel" / "parameters"
+        ps_path = hda_params / "power_save"
+        ps_ctrl_path = hda_params / "power_save_controller"
+        if ps_path.exists() or dry_run:
+            _write_sysfs(ps_path, "0", applied, errors, dry_run)
+        if ps_ctrl_path.exists() or dry_run:
+            _write_sysfs(ps_ctrl_path, "N", applied, errors, dry_run)
+
+    if spec.min_pipewire_quantum is None:
+        return
+
+    if dry_run:
+        applied.append(
+            f"[DRY-RUN] PipeWire clock.min-quantum <- {spec.min_pipewire_quantum} "
+            "& pw-data-loop SCHED_FIFO:88"
+        )
+        return
+
+    if sys_root != Path("/sys"):
+        return
+
+    # Apply clock.min-quantum to active desktop user PipeWire sessions
+    run_user_dir = Path("/run/user")
+    if run_user_dir.is_dir():
+        for user_dir in sorted(run_user_dir.iterdir()):
+            if not user_dir.name.isdigit() or not (user_dir / "pipewire-0").exists():
+                continue
+            uid = int(user_dir.name)
+            try:
+                user_name = pwd.getpwuid(uid).pw_name
+            except KeyError:
+                continue
+            cmd = [
+                "env",
+                f"XDG_RUNTIME_DIR={user_dir}",
+                "pw-metadata",
+                "-n",
+                "settings",
+                "0",
+                "clock.min-quantum",
+                str(spec.min_pipewire_quantum),
+            ]
+            if os.geteuid() == 0 and uid != 0:
+                cmd = ["runuser", "-u", user_name, "--", *cmd]
+            rc, out = run_cmd_safe(cmd)
+            if rc == 0:
+                applied.append(
+                    f"PipeWire ({user_name}) clock.min-quantum <- {spec.min_pipewire_quantum}"
+                )
+            else:
+                errors.append(f"pw-metadata ({user_name}) clock.min-quantum failed: {out.strip()}")
+
+    # Restore SCHED_FIFO:88 on pw-data-loop threads demoted by rtkit-daemon on S3 resume
+    if proc_root.is_dir():
+        promoted_tids: list[str] = []
+        target_comms = {"pipewire", "pipewire-pulse", "wireplumber"}
+        for pid_dir in proc_root.glob("[0-9]*"):
+            if read_text_safe(pid_dir / "comm") not in target_comms:
+                continue
+            task_dir = pid_dir / "task"
+            if not task_dir.is_dir():
+                continue
+            for tid_dir in task_dir.iterdir():
+                if read_text_safe(tid_dir / "comm") == "pw-data-loop":
+                    rc, _ = run_cmd_safe(["chrt", "-f", "-p", "88", tid_dir.name])
+                    if rc == 0:
+                        promoted_tids.append(tid_dir.name)
+        if promoted_tids:
+            applied.append(
+                f"Restored SCHED_FIFO:88 on pw-data-loop TIDs {', '.join(promoted_tids)}"
+            )
+
+
 def _manage_alx_nic(
     spec: WorkloadProfileSpec,
     sys_root: Path,
@@ -473,10 +669,9 @@ def get_startup_profile_status(
     active_unit_path = unit_path if unit_path.exists() else legacy_unit_path
 
     wants_dir = systemd_dir / "multi-user.target.wants"
-    systemd_enabled = (
-        (wants_dir / "aw-m17-profile.service").exists()
-        or (wants_dir / "aw-m17-rapl.service").exists()
-    )
+    systemd_enabled = (wants_dir / "aw-m17-profile.service").exists() or (
+        wants_dir / "aw-m17-rapl.service"
+    ).exists()
     if not systemd_enabled and systemd_dir == _DEFAULT_SYSTEMD_DIR and active_unit_path.exists():
         rc, _ = run_cmd_safe(["systemctl", "is-enabled", "--quiet", active_unit_path.name])
         systemd_enabled = rc == 0
@@ -709,11 +904,10 @@ def apply_workload_profile(
             dry_run,
         )
 
-    # 5. VM Sysctls
+    # 5. VM & File-Watcher Sysctls
     vm_dir = proc_root / "sys" / "vm"
     if vm_dir.is_dir() or dry_run:
         _write_sysfs(vm_dir / "swappiness", str(spec.swappiness), applied, errors, dry_run)
-        _write_sysfs(vm_dir / "dirty_ratio", str(spec.dirty_ratio), applied, errors, dry_run)
         _write_sysfs(
             vm_dir / "dirty_background_ratio",
             str(spec.dirty_background_ratio),
@@ -721,9 +915,29 @@ def apply_workload_profile(
             errors,
             dry_run,
         )
+        _write_sysfs(vm_dir / "dirty_ratio", str(spec.dirty_ratio), applied, errors, dry_run)
+        if spec.min_max_map_count is not None:
+            _ensure_sysctl_floor(
+                vm_dir / "max_map_count", spec.min_max_map_count, applied, errors, dry_run
+            )
 
-    # 6. Unbind unplugged Killer E2500 (alx) in gaming-prime to prevent PCIe MMIO stats stalls
+    inotify_dir = proc_root / "sys" / "fs" / "inotify"
+    for inotify_name, floor_val in (
+        ("max_user_instances", spec.min_inotify_user_instances),
+        ("max_user_watches", spec.min_inotify_user_watches),
+        ("max_queued_events", spec.min_inotify_queued_events),
+    ):
+        if floor_val is not None and (inotify_dir.is_dir() or dry_run):
+            _ensure_sysctl_floor(inotify_dir / inotify_name, floor_val, applied, errors, dry_run)
+
+    # 6. Unbind unplugged Killer E2500 (alx) in gaming/unreal profiles to prevent PCIe MMIO stalls
     _manage_alx_nic(spec, sys_root, applied, errors, dry_run)
+
+    # 6B. Evict resident Ollama models pinning GDDR6 VRAM when entering gaming-prime / unreal-engine
+    _evict_ollama_vram_models(spec, sys_root, applied, errors, dry_run)
+
+    # 6C. Enforce low-crackling audio invariants (HDA power_save=0, PipeWire quantum, SCHED_FIFO:88)
+    _enforce_low_crackling_audio(spec, sys_root, proc_root, applied, errors, dry_run)
 
     # 7. Clear post-S3-resume / custom-profile NVIDIA 30W / 810MHz VRAM clamp if active
     if (
@@ -732,6 +946,7 @@ def apply_workload_profile(
         and spec.name
         in {
             WorkloadProfileName.EXTREME_PERFORMANCE,
+            WorkloadProfileName.UNREAL_ENGINE,
             WorkloadProfileName.GAMING_PRIME,
             WorkloadProfileName.OLLAMA_HEAVY,
         }
@@ -760,22 +975,39 @@ def apply_workload_profile(
             if rc == 0:
                 applied.append("nvidia-smi -rgc (GPU boost clock range unlocked)")
 
-    # 9. Verify live gaming-prime core configuration invariants post-apply
-    if spec.name == WorkloadProfileName.GAMING_PRIME and not dry_run and sys_root == Path("/sys"):
-        inv_ok, inv_violations = verify_gaming_prime_invariants(
-            sys_root=sys_root, proc_root=proc_root
-        )
-        if inv_ok:
-            applied.append(
-                "gaming-prime core invariants verified: "
-                f"profile={GAMING_PRIME_PLATFORM_PROFILE}, "
-                f"fan_boost=+{GAMING_PRIME_FAN_BOOST_PCT}%/+{GAMING_PRIME_FAN_BOOST_PCT}%, "
-                f"RAPL={GAMING_PRIME_PL1_W}W/{GAMING_PRIME_PL2_W}W, "
-                f"GPU=+{GAMING_PRIME_GPU_VF_OFFSET_MHZ}MHz @ <={GAMING_PRIME_GPU_MAX_CLOCK_MHZ}MHz"
+    # 9. Verify live profile core configuration invariants post-apply
+    if not dry_run and sys_root == Path("/sys"):
+        if spec.name == WorkloadProfileName.GAMING_PRIME:
+            inv_ok, inv_violations = verify_gaming_prime_invariants(
+                sys_root=sys_root, proc_root=proc_root
             )
-        else:
-            for violation in inv_violations:
-                errors.append(f"gaming-prime invariant violation: {violation}")
+            if inv_ok:
+                applied.append(
+                    "gaming-prime core invariants verified: "
+                    f"profile={GAMING_PRIME_PLATFORM_PROFILE}, "
+                    f"fan_boost=+{GAMING_PRIME_FAN_BOOST_PCT}%/+{GAMING_PRIME_FAN_BOOST_PCT}%, "
+                    f"RAPL={GAMING_PRIME_PL1_W}W/{GAMING_PRIME_PL2_W}W, "
+                    f"GPU=+{GAMING_PRIME_GPU_VF_OFFSET_MHZ}MHz @ <={GAMING_PRIME_GPU_MAX_CLOCK_MHZ}MHz"
+                )
+            else:
+                for violation in inv_violations:
+                    errors.append(f"gaming-prime invariant violation: {violation}")
+        elif spec.name == WorkloadProfileName.UNREAL_ENGINE:
+            inv_ok, inv_violations = verify_unreal_engine_invariants(
+                sys_root=sys_root, proc_root=proc_root
+            )
+            if inv_ok:
+                applied.append(
+                    "unreal-engine core invariants verified: "
+                    f"profile={UNREAL_ENGINE_PLATFORM_PROFILE}, "
+                    f"fan_boost=+{UNREAL_ENGINE_FAN_BOOST_PCT}%/+{UNREAL_ENGINE_FAN_BOOST_PCT}%, "
+                    f"RAPL={UNREAL_ENGINE_PL1_W}W/{UNREAL_ENGINE_PL2_W}W, "
+                    f"GPU=+{UNREAL_ENGINE_GPU_VF_OFFSET_MHZ}MHz @ <={UNREAL_ENGINE_GPU_MAX_CLOCK_MHZ}MHz, "
+                    f"dirty={UNREAL_ENGINE_DIRTY_BG_RATIO}%/{UNREAL_ENGINE_DIRTY_RATIO}%"
+                )
+            else:
+                for violation in inv_violations:
+                    errors.append(f"unreal-engine invariant violation: {violation}")
 
     # 10. Persist startup profile on boot if requested, or record session profile for S3 resume
     if persist_startup:
@@ -795,58 +1027,113 @@ def apply_workload_profile(
     return tuple(applied), tuple(errors)
 
 
-def verify_gaming_prime_invariants(
-    sys_root: Path = Path("/sys"),
-    proc_root: Path = Path("/proc"),
+def _verify_hardware_invariants(
+    spec: WorkloadProfileSpec,
+    sys_root: Path,
+    proc_root: Path,
+    check_vm_and_sysctl_floors: bool = False,
 ) -> tuple[bool, tuple[str, ...]]:
-    """Verify all core configuration invariants of gaming-prime against live hardware state."""
+    """Verify live sysfs/procfs/NVML state against a profile's core invariants."""
     violations: list[str] = []
     tp = collect_thermal_power(sys_root=sys_root, klog="")
 
-    if tp.platform_profile != GAMING_PRIME_PLATFORM_PROFILE:
+    if tp.platform_profile != spec.platform_profile:
         violations.append(
-            f"platform_profile={tp.platform_profile!r} (expected {GAMING_PRIME_PLATFORM_PROFILE!r})"
+            f"platform_profile={tp.platform_profile!r} (expected {spec.platform_profile!r})"
         )
-    if tp.cpu_fan_boost != GAMING_PRIME_FAN_BOOST_PCT:
-        violations.append(
-            f"cpu_fan_boost={tp.cpu_fan_boost} (expected {GAMING_PRIME_FAN_BOOST_PCT})"
-        )
-    if tp.gpu_fan_boost != GAMING_PRIME_FAN_BOOST_PCT:
-        violations.append(
-            f"gpu_fan_boost={tp.gpu_fan_boost} (expected {GAMING_PRIME_FAN_BOOST_PCT})"
-        )
-    if tp.msr_pl1_w is None or abs(tp.msr_pl1_w - GAMING_PRIME_PL1_W) > 0.5:
-        violations.append(f"msr_pl1_w={tp.msr_pl1_w}W (expected {GAMING_PRIME_PL1_W}W)")
-    if tp.msr_pl2_w is None or abs(tp.msr_pl2_w - GAMING_PRIME_PL2_W) > 0.5:
-        violations.append(f"msr_pl2_w={tp.msr_pl2_w}W (expected {GAMING_PRIME_PL2_W}W)")
-    if tp.mmio_pl1_w is None or abs(tp.mmio_pl1_w - GAMING_PRIME_PL1_W) > 0.5:
-        violations.append(f"mmio_pl1_w={tp.mmio_pl1_w}W (expected {GAMING_PRIME_PL1_W}W)")
-    if tp.mmio_pl2_w is None or abs(tp.mmio_pl2_w - GAMING_PRIME_PL2_W) > 0.5:
-        violations.append(f"mmio_pl2_w={tp.mmio_pl2_w}W (expected {GAMING_PRIME_PL2_W}W)")
+    if tp.cpu_fan_boost != spec.cpu_fan_boost:
+        violations.append(f"cpu_fan_boost={tp.cpu_fan_boost} (expected {spec.cpu_fan_boost})")
+    if tp.gpu_fan_boost != spec.gpu_fan_boost:
+        violations.append(f"gpu_fan_boost={tp.gpu_fan_boost} (expected {spec.gpu_fan_boost})")
+    if tp.msr_pl1_w is None or abs(tp.msr_pl1_w - spec.msr_pl1_w) > 0.5:
+        violations.append(f"msr_pl1_w={tp.msr_pl1_w}W (expected {spec.msr_pl1_w}W)")
+    if tp.msr_pl2_w is None or abs(tp.msr_pl2_w - spec.msr_pl2_w) > 0.5:
+        violations.append(f"msr_pl2_w={tp.msr_pl2_w}W (expected {spec.msr_pl2_w}W)")
+    if tp.mmio_pl1_w is None or abs(tp.mmio_pl1_w - spec.mmio_pl1_w) > 0.5:
+        violations.append(f"mmio_pl1_w={tp.mmio_pl1_w}W (expected {spec.mmio_pl1_w}W)")
+    if tp.mmio_pl2_w is None or abs(tp.mmio_pl2_w - spec.mmio_pl2_w) > 0.5:
+        violations.append(f"mmio_pl2_w={tp.mmio_pl2_w}W (expected {spec.mmio_pl2_w}W)")
 
     max_freq = read_int_safe(
         sys_root / "devices" / "system" / "cpu" / "cpu0" / "cpufreq" / "scaling_max_freq"
     )
-    if max_freq is not None and max_freq != GAMING_PRIME_CPU_MAX_FREQ_KHZ:
-        violations.append(
-            f"cpu0 scaling_max_freq={max_freq} (expected {GAMING_PRIME_CPU_MAX_FREQ_KHZ})"
-        )
+    if max_freq is not None and max_freq != spec.cpu_max_freq_khz:
+        violations.append(f"cpu0 scaling_max_freq={max_freq} (expected {spec.cpu_max_freq_khz})")
 
-    alx_bound = sorted((sys_root / "bus" / "pci" / "drivers" / "alx").glob("0000:*"))
-    for dev_dir in alx_bound:
-        net_dir = dev_dir / "net"
-        ifaces = sorted(net_dir.glob("*")) if net_dir.is_dir() else []
-        if not any(read_int_safe(iface / "carrier") == 1 for iface in ifaces):
-            violations.append(f"unplugged alx NIC {dev_dir.name} still bound")
+    if spec.quiesce_unplugged_alx:
+        alx_bound = sorted((sys_root / "bus" / "pci" / "drivers" / "alx").glob("0000:*"))
+        for dev_dir in alx_bound:
+            net_dir = dev_dir / "net"
+            ifaces = sorted(net_dir.glob("*")) if net_dir.is_dir() else []
+            if not any(read_int_safe(iface / "carrier") == 1 for iface in ifaces):
+                violations.append(f"unplugged alx NIC {dev_dir.name} still bound")
+
+    if spec.disable_snd_hda_power_save:
+        hda_ps = sys_root / "module" / "snd_hda_intel" / "parameters" / "power_save"
+        if hda_ps.exists():
+            ps_val = read_int_safe(hda_ps)
+            if ps_val != 0:
+                violations.append(f"snd_hda_intel power_save={ps_val} (expected 0)")
+
+    if check_vm_and_sysctl_floors:
+        vm_dir = proc_root / "sys" / "vm"
+        dirty_r = read_int_safe(vm_dir / "dirty_ratio")
+        if dirty_r is not None and dirty_r != spec.dirty_ratio:
+            violations.append(f"dirty_ratio={dirty_r}% (expected {spec.dirty_ratio}%)")
+        dirty_bg = read_int_safe(vm_dir / "dirty_background_ratio")
+        if dirty_bg is not None and dirty_bg != spec.dirty_background_ratio:
+            violations.append(
+                f"dirty_background_ratio={dirty_bg}% (expected {spec.dirty_background_ratio}%)"
+            )
+        if spec.min_max_map_count is not None:
+            map_cnt = read_int_safe(vm_dir / "max_map_count")
+            if map_cnt is not None and map_cnt < spec.min_max_map_count:
+                violations.append(f"vm.max_map_count={map_cnt} (< {spec.min_max_map_count} floor)")
+        inotify_dir = proc_root / "sys" / "fs" / "inotify"
+        for inotify_name, floor_val in (
+            ("max_user_instances", spec.min_inotify_user_instances),
+            ("max_user_watches", spec.min_inotify_user_watches),
+            ("max_queued_events", spec.min_inotify_queued_events),
+        ):
+            if floor_val is not None:
+                cur_val = read_int_safe(inotify_dir / inotify_name)
+                if cur_val is not None and cur_val < floor_val:
+                    violations.append(f"fs.inotify.{inotify_name}={cur_val} (< {floor_val} floor)")
 
     if sys_root == Path("/sys"):
         gpu = collect_gpu_display(sys_root=sys_root, proc_root=proc_root, klog="")
-        if gpu.gpu_vf_offset_mhz != GAMING_PRIME_GPU_VF_OFFSET_MHZ:
+        if gpu.gpu_vf_offset_mhz != spec.gpu_vf_offset_mhz:
             violations.append(
                 f"gpu_vf_offset_mhz={gpu.gpu_vf_offset_mhz} "
-                f"(expected +{GAMING_PRIME_GPU_VF_OFFSET_MHZ} MHz)"
+                f"(expected +{spec.gpu_vf_offset_mhz} MHz)"
             )
         if gpu.gpu_power_cap_w is not None and gpu.gpu_power_cap_w < 60.0:
             violations.append(f"gpu_power_cap_w={gpu.gpu_power_cap_w}W (clamped below 90W)")
 
     return len(violations) == 0, tuple(violations)
+
+
+def verify_gaming_prime_invariants(
+    sys_root: Path = Path("/sys"),
+    proc_root: Path = Path("/proc"),
+) -> tuple[bool, tuple[str, ...]]:
+    """Verify all core configuration invariants of gaming-prime against live hardware state."""
+    return _verify_hardware_invariants(
+        spec=PROFILES[WorkloadProfileName.GAMING_PRIME],
+        sys_root=sys_root,
+        proc_root=proc_root,
+        check_vm_and_sysctl_floors=False,
+    )
+
+
+def verify_unreal_engine_invariants(
+    sys_root: Path = Path("/sys"),
+    proc_root: Path = Path("/proc"),
+) -> tuple[bool, tuple[str, ...]]:
+    """Verify all core configuration invariants of unreal-engine against live hardware & sysctl state."""
+    return _verify_hardware_invariants(
+        spec=PROFILES[WorkloadProfileName.UNREAL_ENGINE],
+        sys_root=sys_root,
+        proc_root=proc_root,
+        check_vm_and_sysctl_floors=True,
+    )

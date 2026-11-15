@@ -211,13 +211,30 @@ When `gaming-prime` is applied, `_manage_alx_nic()` in [`src/aw_m17_diag/engine/
 
 ---
 
-## 7. Automatic Startup & S3 Resume Profile Management
+## 7. Unreal Engine 5.8 Workstation Tuning (`unreal-engine` Profile)
+
+Unreal Engine 5.8 (`/opt/UnrealEngine`) places a **bimodal real-time 3D + 12-thread burst compute** load on `0DG9D5` that differs from both steady-state gaming (`gaming-prime`) and pure LLM compute (`ollama-heavy`):
+
+1. **Bimodal Shared-Heatpipe Calibration (`45W` PL1 / `70W` PL2 + `+100%` Dual Blowers + `+135 MHz @ 1,560 MHz` NVML UV):**
+   - Unlike games (where GPU utilization stays near 99% continuously and CPU needs only `38W`), Unreal Editor frequently launches 12-thread `ShaderCompileWorker` (DXC SPIR-V), `UnrealBuildTool` (`clang++` / `lld`), and `ZenServer` Oodle compression bursts while a real-time Lumen / Nanite viewport remains active.
+   - `unreal-engine` unlocks AWCC `custom` (`+100%` / `+100%` dual-fan exhaust) and pairs **`45W` PL1 / `70W` PL2** (`+18.4%` sustained CPU budget over `gaming-prime`'s `38W`, locked to Intel's nominal `45W` TDP so Core 0 coldplate bleed does not saturate the shared vapor loop) with the **`+135 MHz` @ `1,560 MHz` NVML GPU undervolt** (preserving 2 Turing `15 MHz` PLL bins of $V_{\min}$ margin below `+165 MHz` so `UnrealEditor` never crashes with `Xid 109` / `VK_ERROR_DEVICE_LOST`).
+2. **DRAM-less `SM2268XT` NVMe Writeback Smoothing (`dirty_background_ratio=2`, `dirty_ratio=6`):**
+   - On `62.6 GiB` RAM with `kernel.hung_task_panic = 1` (`120s` timeout), `5% / 10%` dirty thresholds allow `3.1–6.3 GiB` of un-flushed pages before synchronous throttling, which can saturate the DRAM-less `Inland QN450` SLC cache during massive `DerivedDataCache` (`DDC`), `.pak` cooking, or debug `lld` link bursts. Tightening to **`2% / 6%` (`~1.25 GiB / ~3.75 GiB`)** streams DDC writes continuously and keeps `Sensor 2` controller temperatures below the `78°C` throttle cliff.
+3. **Linux File-Watcher (`fs.inotify`) & VMA (`vm.max_map_count`) Floors:**
+   - Enforces `fs.inotify.max_user_instances >= 2048` (remediating the `128` kernel default that triggers `EMFILE` across `FDirectoryWatcherLinux`, `ZenServer`, Live Coding, and IDE file watchers), `fs.inotify.max_user_watches >= 1,048,576`, `fs.inotify.max_queued_events >= 65,536`, and `vm.max_map_count >= 1,048,576`.
+4. **8 GB GDDR6 (`RTX 2070 Max-Q`) Pool Guidance & Preflight Check:**
+   - Run `uv run aw-m17-diag preflight --workload unreal` before launching heavy UE 5.8 projects to verify `>= 6 GiB` free GDDR6 VRAM, unclamped `90W` TGP, `>= 24 GiB` available RAM, and `unreal-engine` invariants (`PRE-UE-INV`). For heavy Lumen + Virtual Shadow Map scenes on `8192 MiB` VRAM, setting `r.Streaming.PoolSize=2000` (or `Medium`/`High` scalability while editing) prevents `VK_ERROR_OUT_OF_DEVICE_MEMORY`.
+
+---
+
+## 8. Automatic Startup & S3 Resume Profile Management
 
 You can manage whether a workload profile loads for the current session only or automatically on every boot:
 
 ```bash
 # Apply a profile for the current session only (does not alter boot startup profile):
 sudo $(which uv) run aw-m17-diag profile set gaming-prime
+sudo $(which uv) run aw-m17-diag profile set unreal-engine
 sudo $(which uv) run aw-m17-diag profile set extreme-performance
 
 # Apply a profile AND set it to load automatically on system startup:

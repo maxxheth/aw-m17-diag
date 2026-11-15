@@ -6,11 +6,12 @@ Technical documentation and CLI reference for the Alienware m17 R1 (`0DG9D5`, BI
 
 ## 1. Workload Profiles & `profile` CLI Reference
 
-`aw-m17-diag` provides 5 hardware tuning profiles managed through `aw-m17-diag profile`:
+`aw-m17-diag` provides 6 hardware tuning profiles managed through `aw-m17-diag profile`:
 
 | Profile Name | ACPI `platform_profile` | CPU `EPP` | CPU RAPL (`PL1` / `PL2`) | CPU Max Clock | GPU Boost & V/F Curve | Exhaust Fan Boost | Unplugged `alx` NIC | Primary Use Case |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **`extreme-performance`** | `balanced-performance` | `performance` (`0x00`) | `70W` / `90W` | `4.50 GHz` | Unlocked (`90W` `P0`) | EC Auto | Auto-unbound | Maximum zero-compromise all-core CPU turbo + 90W GPU performance; zero frequency ramp latency. |
+| **`unreal-engine`** | `custom` (`platform-profile-0`) | `balance_performance` (`0x80`) | `45W` / `70W` | `4.50 GHz` | `1,560 MHz` (`+135 MHz` NVML UV) | `+100%` / `+100%` | Auto-unbound | Bimodal Unreal Engine 5.8 workstation profile (Lumen/Nanite viewport + 12T `ShaderCompileWorker` / `clang++` bursts, `2%/6%` `SM2268XT` DDC writeback, `inotify` & VMA floors). |
 | **`gaming-prime`** | `custom` (`platform-profile-0`) | `balance_performance` (`0x80`) | `38W` / `60W` | `4.50 GHz` | `1,560 MHz` (`+135 MHz` NVML UV) | `+100%` / `+100%` | Auto-unbound | Cool & sustained 60Hz PRIME gaming enforcing core thermal invariants (`+100%` exhaust fan boost, `+135 MHz` V/F undervolt @ `1,560 MHz`, `38W/60W` shared-heatpipe relief, `<16.67ms` vblank pacing). |
 | **`ollama-heavy`** | `balanced-performance` | `balance_performance` (`0x80`) | `65W` / `85W` | `4.50 GHz` | Unlocked (`90W` `P0`) | EC Auto | Bound (hotplug ready) | Sustained multi-hour local LLM inference (`AVX2` + `CUDA`) with `swappiness=10` & `dirty_ratio=10`. |
 | **`balanced-daily`** | `balanced` | `balance_performance` (`0x80`) | `45W` / `70W` | `4.50 GHz` | Unlocked | EC Auto (`0%`) | Bound (hotplug ready) | Quiet daily workstation profile locked to Intel nominal `45W` TDP. |
@@ -25,6 +26,7 @@ uv run aw-m17-diag profile show
 # 2. Apply a profile for the CURRENT SESSION ONLY (does not overwrite boot startup default)
 #    Records session state in /run/aw-m17-diag/current-profile so S3 sleep/resume preserves it.
 sudo $(which uv) run aw-m17-diag profile set gaming-prime
+sudo $(which uv) run aw-m17-diag profile set unreal-engine
 sudo $(which uv) run aw-m17-diag profile set extreme-performance
 
 # 3. Apply a profile immediately AND set it to load automatically on system startup
@@ -57,7 +59,8 @@ sudo $(which uv) run aw-m17-diag profile startup --disable
     3. **Option 3:** Native per-driver `/sys/class/platform-profile/platform-profile-0/profile` `custom` (`0x00`) activation in Linux 7.0 to unlock `0..100%` `fan1_boost` / `fan2_boost` (`SetAddonSpeedPercent`) cleanly under `profile_lock` without out-of-tree WMI kernel modules.
   - Side-by-side **Preset Decision Matrix** (`Baseline` / `extreme-performance` vs. `Preset A: Cool & Consistent`, `Preset B: gaming-prime`, and `Preset C: Aggressive Pre-Staged Fans`).
   - **Technical Appendix (Section 5):** Post-S3-Resume **30W / 810 MHz (`P5`) GPU Clamp** (`_PSR=0` race, `.bss+0x1fece0` state cache, and `nvidia_power_unclamp.ko`).
-  - **Technical Appendix (Section 6):** Unplugged Killer E2500 (`alx`, `0000:6f:00.0`) **PCIe MMIO Stats Stall** (`alx_update_hw_stats` 49-register `ioread32` bottleneck under Wine/Ubisoft Connect that dropped framerates to **14.0 FPS**, and automatic unbinding in `gaming-prime` / `extreme-performance`).
-  - **Startup & S3 Resume Persistence Guide (Section 7):** How `/etc/aw-m17-diag/startup-profile`, `/run/aw-m17-diag/current-profile`, `/etc/systemd/system/aw-m17-profile.service`, and `/lib/systemd/system-sleep/zz-aw-m17-profile` interact.
+  - **Technical Appendix (Section 6):** Unplugged Killer E2500 (`alx`, `0000:6f:00.0`) **PCIe MMIO Stats Stall** (`alx_update_hw_stats` 49-register `ioread32` bottleneck under Wine/Ubisoft Connect that dropped framerates to **14.0 FPS**, and automatic unbinding in `gaming-prime` / `unreal-engine` / `extreme-performance`).
+  - **Unreal Engine 5.8 Workstation Guide (Section 7):** Bimodal `45W/70W` RAPL + `+135 MHz @ 1,560 MHz` NVML undervolt (`Xid 109` guardband), `2%/6%` `SM2268XT` DDC writeback, `fs.inotify` / `vm.max_map_count` floors, and 8 GB GDDR6 preflight checks (`--workload unreal`).
+  - **Startup & S3 Resume Persistence Guide (Section 8):** How `/etc/aw-m17-diag/startup-profile`, `/run/aw-m17-diag/current-profile`, `/etc/systemd/system/aw-m17-profile.service`, and `/lib/systemd/system-sleep/zz-aw-m17-profile` interact.
 - **[Initial Architecture & Stabilization Plan (`../PLAN.md`)](../PLAN.md)**
   - Root-cause forensics for historical crashes, NVMe APST (`default_ps_max_latency_us`), `ath10k_pci` DMAR faults, and 3-tier mitigation design.

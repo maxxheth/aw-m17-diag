@@ -41,7 +41,7 @@ profile_app = typer.Typer(
     name="profile",
     help=(
         "Inspect or apply Alienware m17 workload tuning profiles "
-        "(extreme-performance, ollama-heavy, gaming-prime, balanced-daily, powersave)."
+        "(extreme-performance, unreal-engine, ollama-heavy, gaming-prime, balanced-daily, powersave)."
     ),
     no_args_is_help=True,
 )
@@ -72,7 +72,11 @@ def cmd_crash_report(
 def cmd_preflight(
     workload: Annotated[
         str,
-        typer.Option("--workload", "-w", help="Target workload: 'ollama' or 'gaming'."),
+        typer.Option(
+            "--workload",
+            "-w",
+            help="Target workload: 'ollama', 'gaming', or 'unreal'.",
+        ),
     ] = "ollama",
     model_size_gb: Annotated[
         float,
@@ -84,10 +88,17 @@ def cmd_preflight(
     ] = 22.0,
 ) -> None:
     """Verify workstation stability, NVMe APST, and RAM+Swap headroom before starting a heavy workload."""
+    normalized = workload.strip().lower()
+    if normalized not in {"ollama", "gaming", "unreal"}:
+        console.print(
+            f"[bold red]✗[/bold red] Unsupported workload {workload!r}. "
+            "Choose 'ollama', 'gaming', or 'unreal'."
+        )
+        raise typer.Exit(code=2)
     report = run_full_audit()
     ready, checks = evaluate_preflight(
         report=report,
-        workload=workload,
+        workload=normalized,
         model_size_gb=model_size_gb,
     )
     render_preflight_report(
@@ -200,7 +211,9 @@ def cmd_profile_startup(
     ] = True,
     dry_run: Annotated[
         bool,
-        typer.Option("--dry-run", help="Preview startup configuration changes without mutating system."),
+        typer.Option(
+            "--dry-run", help="Preview startup configuration changes without mutating system."
+        ),
     ] = False,
 ) -> None:
     """Inspect, enable, or disable automatic workload profile loading on system startup."""

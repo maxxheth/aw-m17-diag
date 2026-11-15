@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from aw_m17_diag.collectors.memory import collect_memory
 from aw_m17_diag.collectors.pcie_iommu import collect_pcie_iommu
 from aw_m17_diag.collectors.storage import collect_storage
 from aw_m17_diag.collectors.thermal_power import collect_thermal_power
@@ -103,3 +104,32 @@ def test_collect_thermal_power_reads_rapl_and_alienware_wmi(tmp_path: Path) -> N
     assert snap.msr_pl1_w == 200.0
     assert snap.msr_pl2_w == 90.0
     assert snap.acpi_invalid_crit_temp_bug
+
+
+def test_collect_memory_reads_vm_and_inotify_sysctls(tmp_path: Path) -> None:
+    """Verify collect_memory reads max_map_count and fs/inotify limits from procfs."""
+    proc_root = tmp_path / "proc"
+    vm_dir = proc_root / "sys" / "vm"
+    vm_dir.mkdir(parents=True)
+    (vm_dir / "swappiness").write_text("10\n", encoding="utf-8")
+    (vm_dir / "vfs_cache_pressure").write_text("50\n", encoding="utf-8")
+    (vm_dir / "dirty_ratio").write_text("6\n", encoding="utf-8")
+    (vm_dir / "dirty_background_ratio").write_text("2\n", encoding="utf-8")
+    (vm_dir / "max_map_count").write_text("1048576\n", encoding="utf-8")
+
+    inotify_dir = proc_root / "sys" / "fs" / "inotify"
+    inotify_dir.mkdir(parents=True)
+    (inotify_dir / "max_user_instances").write_text("2048\n", encoding="utf-8")
+    (inotify_dir / "max_user_watches").write_text("1048576\n", encoding="utf-8")
+    (inotify_dir / "max_queued_events").write_text("65536\n", encoding="utf-8")
+
+    (proc_root / "meminfo").write_text("Dirty:              4096 kB\n", encoding="utf-8")
+
+    snap = collect_memory(proc_root=proc_root)
+    assert snap.dirty_ratio == 6
+    assert snap.dirty_background_ratio == 2
+    assert snap.dirty_pages_mib == 4.0
+    assert snap.max_map_count == 1_048_576
+    assert snap.inotify_max_user_instances == 2048
+    assert snap.inotify_max_user_watches == 1_048_576
+    assert snap.inotify_max_queued_events == 65_536
