@@ -17,7 +17,10 @@ from aw_m17_diag.collectors._utils import (
     read_text_safe,
     run_cmd_safe,
 )
-from aw_m17_diag.collectors.gpu_display import collect_gpu_display
+from aw_m17_diag.collectors.gpu_display import (
+    check_steam_sandbox_nvidia_icd,
+    collect_gpu_display,
+)
 from aw_m17_diag.collectors.thermal_power import collect_thermal_power
 from aw_m17_diag.models import (
     StartupProfileStatus,
@@ -721,23 +724,9 @@ def refresh_steam_flatpak_sandbox(
                 for pid_dir in proc_root.glob("[0-9]*"):
                     if read_text_safe(pid_dir / "comm") != "steam":
                         continue
-                    icd_file = (
-                        pid_dir
-                        / "root"
-                        / "usr"
-                        / "lib"
-                        / "x86_64-linux-gnu"
-                        / "GL"
-                        / "vulkan"
-                        / "icd.d"
-                        / "nvidia_icd.json"
-                    )
-                    try:
-                        if icd_file.exists():
-                            icd_live = True
-                            break
-                    except OSError:
-                        continue
+                    if check_steam_sandbox_nvidia_icd(pid_dir) is True:
+                        icd_live = True
+                        break
             if icd_live:
                 break
             time.sleep(0.5)

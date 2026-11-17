@@ -116,6 +116,29 @@ def _get_flatpak_nvidia_gl_versions() -> tuple[str, ...]:
     return tuple(sorted(versions))
 
 
+def check_steam_sandbox_nvidia_icd(pid_dir: Path) -> bool | None:
+    """Inspect a Steam sandbox's nvidia_icd.json mount relative to its container root.
+
+    Returns True if live, False if a dangling symlink (stale OSTree mount), or None if absent.
+    """
+    sandbox_root = pid_dir / "root"
+    icd_dir = sandbox_root / "usr" / "lib" / "x86_64-linux-gnu" / "GL" / "vulkan" / "icd.d"
+    try:
+        if not icd_dir.is_dir():
+            return None
+        nv_icd = icd_dir / "nvidia_icd.json"
+        if nv_icd.is_symlink():
+            if nv_icd.exists():
+                return True
+            target = nv_icd.readlink()
+            if target.is_absolute():
+                return (sandbox_root / target.relative_to("/")).exists()
+            return False
+        return True if nv_icd.exists() else None
+    except OSError:
+        return None
+
+
 def _is_steam_flatpak_gl_mount_stale(proc_root: Path = Path("/proc")) -> bool:
     """Detect if a running Steam Flatpak sandbox has a broken/unlinked nvidia_icd.json mount."""
     if not proc_root.is_dir():
@@ -123,15 +146,8 @@ def _is_steam_flatpak_gl_mount_stale(proc_root: Path = Path("/proc")) -> bool:
     for pid_dir in proc_root.glob("[0-9]*"):
         if read_text_safe(pid_dir / "comm") != "steam":
             continue
-        icd_dir = pid_dir / "root" / "usr" / "lib" / "x86_64-linux-gnu" / "GL" / "vulkan" / "icd.d"
-        try:
-            if not icd_dir.is_dir():
-                continue
-            nv_icd = icd_dir / "nvidia_icd.json"
-            if nv_icd.is_symlink() and not nv_icd.exists():
-                return True
-        except OSError:
-            continue
+        if check_steam_sandbox_nvidia_icd(pid_dir) is False:
+            return True
     return False
 
 

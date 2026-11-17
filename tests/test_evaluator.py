@@ -8,7 +8,10 @@ from unittest.mock import patch
 
 import pytest
 
-from aw_m17_diag.collectors.gpu_display import _is_steam_flatpak_gl_mount_stale
+from aw_m17_diag.collectors.gpu_display import (
+    _is_steam_flatpak_gl_mount_stale,
+    check_steam_sandbox_nvidia_icd,
+)
 from aw_m17_diag.engine.evaluator import evaluate_preflight, evaluate_snapshots
 from aw_m17_diag.engine.profiles import (
     GAMING_PRIME_CPU_MAX_FREQ_KHZ,
@@ -810,6 +813,22 @@ def test_stale_steam_flatpak_gl_mount_detection_and_refresh_dry_run(tmp_path: Pa
     target_icd.write_text('{"ICD": {}}\n', encoding="utf-8")
     icd_link.symlink_to(target_icd)
     assert _is_steam_flatpak_gl_mount_stale(proc_root) is False
+    assert check_steam_sandbox_nvidia_icd(steam_proc) is True
+
+    # Container-absolute symlink (/usr/lib/... inside sandbox_root) should resolve against steam_proc/root
+    container_abs_target = Path(
+        "/usr/lib/x86_64-linux-gnu/GL/nvidia-595-99-02/vulkan/icd.d/nvidia_icd.json"
+    )
+    container_real_file = steam_proc / "root" / container_abs_target.relative_to("/")
+    icd_link.unlink()
+    icd_link.symlink_to(container_abs_target)
+    assert _is_steam_flatpak_gl_mount_stale(proc_root) is True
+    assert check_steam_sandbox_nvidia_icd(steam_proc) is False
+
+    container_real_file.parent.mkdir(parents=True)
+    container_real_file.write_text('{"ICD": {}}\n', encoding="utf-8")
+    assert _is_steam_flatpak_gl_mount_stale(proc_root) is False
+    assert check_steam_sandbox_nvidia_icd(steam_proc) is True
 
     storage, pcie, gpu, tp = make_sample_snapshots()
     mem = MemorySnapshot(
